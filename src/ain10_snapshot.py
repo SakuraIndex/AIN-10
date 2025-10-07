@@ -1,17 +1,16 @@
 # -*- coding: utf-8 -*-
 """
 AIN-10 (AI US) Intraday Snapshot
-- 米国AIセクター10社の1日（当日）指数チャート
-- 5分足で算出
+- 米国AIセクター10社の1日（当日）指数チャート（5分足優先）
 - 出力: docs/outputs/ain10_intraday.csv / ain10_intraday.png / ain10_intraday_post.txt
 """
 
 import os
 from datetime import datetime, timezone, timedelta
 import pandas as pd
+import numpy as np
 import yfinance as yf
 import matplotlib.pyplot as plt
-import numpy as np
 
 # ====== 設定 ======
 TICKERS = [
@@ -24,8 +23,8 @@ CSV_PATH = os.path.join(OUT_DIR, "ain10_intraday.csv")
 IMG_PATH = os.path.join(OUT_DIR, "ain10_intraday.png")
 TXT_PATH = os.path.join(OUT_DIR, "ain10_intraday_post.txt")
 
-INTERVAL = "5m"  # 5分足
-PERIOD = "1d"    # 当日1日分
+PREFERRED_INTERVALS = ["5m", "15m", "30m", "60m"]  # 順にフォールバック
+PERIOD = "1d"  # 当日
 # ===================
 
 
@@ -37,46 +36,75 @@ def ensure_outdir():
     os.makedirs(OUT_DIR, exist_ok=True)
 
 
-def fetch_intraday(ticker: str) -> pd.Series:
-    """ティッカーごとに当日5分足を取得して終値Seriesを返す"""
-    try:
-        df = yf.download(
-            ticker,
-            period=PERIOD,
-            interval=INTERVAL,
-            progress=False,
-            prepost=False,
-            threads=False,
-        )
-        if "Close" not in df.columns:
-            return pd.Series(dtype=float)
-        s = pd.to_numeric(df["Close"], errors="coerce").dropna()
-        s.index = s.index.tz_localize(None)
-        return s
-    except Exception as e:
-        print(f"[WARN] fetch failed for {ticker}: {e}")
+def force_series_close(df: pd.DataFrame) -> pd.Series:
+    """
+    df["Close"] を必ず 1次元 Series(float) にして返す。
+    想定外型でも Series に包んで to_numeric で強制変換。
+    """
+    if df is None or df.empty:
         return pd.Series(dtype=float)
+
+    # yfinance は MultiIndex になることがあるが、単一ティッカーなら基本通常列
+    close = df.get("Close", None)
+    if close is None:
+        return pd.Series(dtype=float)
+
+    # numpy配列/スカラー等でも Series に包む
+    if not isinstance(close, (pd.Series, pd.Index)):
+        close = pd.Series(close, index=df.index)
+
+    s = pd.to_numeric(pd.Series(close), errors="coerce").dropna()
+    # index の tz を外す（混在対策）
+    try:
+        s.index = pd.DatetimeIndex(s.index).tz_localize(None)
+    except Exception:
+        pass
+    return s
+
+
+def fetch_intraday_one(ticker: str) -> pd.Series:
+    """
+    1銘柄を複数 interval で試行し、最初に取れた Series を返す。
+    """
+    tk = yf.Ticker(ticker)
+    for iv in PREFERRED_INTERVALS:
+        try:
+            df = tk.history(
+                period=PERIOD,
+                interval=iv,
+                prepost=False,
+                auto_adjust=False,
+                actions=False,
+            )
+            s = force_series_close(df)
+            if not s.empty:
+                return s
+        except Exception as e:
+            print(f"[WARN] fetch failed for {ticker} ({iv}): {e}")
+            continue
+    return pd.Series(dtype=float)
 
 
 def build_index(price_df: pd.DataFrame) -> pd.Series:
-    """等加重のAIN-10インデックスを計算"""
-    returns = price_df.pct_change()
-    basket = returns.mean(axis=1, skipna=True)
-    index_series = (1 + basket).cumprod() * 100
+    """
+    等金額（等加重）で当日の変化率を平均し、基準0%からの累積を可視化するため
+    当日始値比 (%) を直接平均した Series を返す。
+    """
+    base = price_df.iloc[0]
+    change_pct = (price_df / base - 1.0) * 100.0
+    index_series = change_pct.mean(axis=1, skipna=True)
     index_series.name = "AIN-10"
     return index_series
 
 
 def plot_chart(index_series: pd.Series):
-    """チャート描画：陽線は青緑、陰線は赤"""
+    """当日インデックスのライン色：上昇＝青緑、下落＝赤"""
     plt.close("all")
     fig, ax = plt.subplots(figsize=(16, 9), dpi=160)
     fig.patch.set_facecolor("black")
     ax.set_facecolor("black")
 
-    # 当日の変化で色を分ける
     color = "#00ffff" if index_series.iloc[-1] >= index_series.iloc[0] else "#ff5050"
-
     ax.plot(index_series.index, index_series.values, color=color, linewidth=3, label="AIN-10")
     ax.legend(facecolor="black", labelcolor="white")
 
@@ -84,7 +112,6 @@ def plot_chart(index_series: pd.Series):
     ax.set_xlabel("Time", color="white")
     ax.set_ylabel("Change vs Open (%)", color="white")
     ax.tick_params(colors="white")
-
     for spine in ax.spines.values():
         spine.set_color("#444")
 
@@ -100,22 +127,23 @@ def main():
 
     series_map = {}
     for t in TICKERS:
-        s = fetch_intraday(t)
-        if not s.empty:
-            series_map[t] = s
+        s = fetch_intraday_one(t)
+        if s.empty:
+            print(f"[WARN] No intraday data for {t}")
         else:
-            print(f"[WARN] No data for {t}")
+            series_map[t] = s
 
     if not series_map:
         raise RuntimeError("No intraday data for any ticker.")
 
-    df = pd.concat(series_map, axis=1)
-    df = df.ffill().dropna(how="all")
+    # 列方向に結合し、前方補完・全欠損行は落とす
+    df = pd.concat(series_map, axis=1).ffill().dropna(how="all")
+    # 列MultiIndexの最上位を外して通常列名化（ORCL, PLTR, ...）
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
 
-    # リターン計算
-    base = df.iloc[0]
-    df_change = (df / base - 1) * 100
-    index_series = df_change.mean(axis=1, skipna=True)
+    # 指数（当日始値比の平均）
+    index_series = build_index(df)
 
     # 保存
     pd.DataFrame(index_series).to_csv(CSV_PATH, encoding="utf-8-sig")
@@ -124,7 +152,7 @@ def main():
     # プロット
     plot_chart(index_series)
 
-    # 投稿文
+    # 投稿用テキスト
     chg = index_series.iloc[-1]
     sign = "🔺" if chg >= 0 else "🔻"
     with open(TXT_PATH, "w", encoding="utf-8") as f:
@@ -134,7 +162,6 @@ def main():
             f"構成銘柄：{ ' / '.join(TICKERS) }\n"
             f"#AI株 #AIN10 #米国株\n"
         )
-
     print(f"[OK] TXT saved: {TXT_PATH}")
     print("[DONE]")
 
