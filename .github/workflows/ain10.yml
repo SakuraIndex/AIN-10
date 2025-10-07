@@ -1,0 +1,43 @@
+name: AIN-10 Daily Snapshot
+
+permissions:
+  contents: write
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 1 * * 2-6"  # JST 10:00（米国引け後）
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run AIN-10 snapshot
+        run: python src/ain10_snapshot.py
+
+      - name: Commit & push outputs
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add docs/outputs/* || true
+          if ! git diff --cached --quiet; then
+            git commit -m "Auto update: AIN-10 $(date -u '+%Y-%m-%d %H:%M:%SZ')"
+            git push
+          else
+            echo "No changes."
+          fi
