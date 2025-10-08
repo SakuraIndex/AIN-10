@@ -2,10 +2,10 @@
 # -*- coding: utf-8 -*-
 
 """
-桜Index - 長期チャート自動生成スクリプト（出来高・移動平均線対応）
+桜Index - 長期チャート自動生成スクリプト（出来高＋移動平均線対応・入力自動検出付き）
 ────────────────────────────
 入力:
-  docs/outputs/{key}_intraday.csv  （or *_intraday.txt）
+  docs/outputs/{key}_intraday.csv  （または *_intraday.txt）
 出力:
   docs/outputs/{key}_{7d,1m,1y}.png
   docs/outputs/{key}_{7d,1m,1y}.csv
@@ -13,6 +13,7 @@
 
 import os
 import re
+import glob
 from datetime import datetime, timedelta, timezone
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -21,36 +22,49 @@ JST = timezone(timedelta(hours=9))
 plt.rcParams['font.family'] = 'Noto Sans CJK JP'
 
 # === 設定 ===
-SMA_WINDOWS = [5, 25, 75]  # 移動平均線の日数
+SMA_WINDOWS = [5, 25, 75]  # 移動平均線の期間
 VOLUME_COLUMN_CANDIDATES = ["volume", "vol", "出来高"]
 
-
-def log(msg): print(f"[long_charts] {msg}")
-
+def log(msg): 
+    print(f"[long_charts] {msg}")
 
 def find_input(base, key):
-    for name in [f"{key}_intraday.csv", f"{key}_intraday.txt", f"{key}.csv"]:
-        path = os.path.join(base, name)
-        if os.path.exists(path):
-            return path
-    return None
+    """
+    指定keyのファイルを探し、見つからない場合は *_intraday.csv を自動検出
+    """
+    candidates = [
+        os.path.join(base, f"{key}_intraday.csv"),
+        os.path.join(base, f"{key}_intraday.txt"),
+        os.path.join(base, f"{key}.csv"),
+    ]
+    for p in candidates:
+        if os.path.exists(p):
+            return p
 
+    # ▼ fallback（最初に見つかった *_intraday.csv / txt）
+    for pattern in (os.path.join(base, "*_intraday.csv"),
+                    os.path.join(base, "*_intraday.txt")):
+        files = sorted(glob.glob(pattern))
+        if files:
+            print(f"[long_charts] fallback to {files[0]}")
+            return files[0]
+
+    return None
 
 def read_data(path):
     """CSV/TXTから時系列データを抽出（time, value, volume）"""
     df = pd.read_csv(path)
-    # 列名正規化
     df.columns = [c.lower().strip() for c in df.columns]
+
     t_candidates = [c for c in df.columns if c in ("time", "timestamp", "date", "datetime")]
     v_candidates = [c for c in df.columns if c in ("close", "price", "value", "index")]
     vol_candidates = [c for c in df.columns if c in VOLUME_COLUMN_CANDIDATES]
+
     if not t_candidates or not v_candidates:
-        # 最低限2列は (time, value)
         df.columns = ["time", "value"] + list(df.columns[2:])
     tcol, vcol = t_candidates[0] if t_candidates else "time", v_candidates[0] if v_candidates else "value"
     volcol = vol_candidates[0] if vol_candidates else None
 
-    # 時刻parse
     def parse_time(x):
         if pd.isna(x): return pd.NaT
         s = str(x)
@@ -70,9 +84,9 @@ def read_data(path):
         df["volume"] = pd.to_numeric(df[volcol], errors="coerce")
     else:
         df["volume"] = 0
+
     df = df.dropna(subset=["time", "value"]).sort_values("time")
     return df[["time", "value", "volume"]]
-
 
 def to_daily(df):
     """日次データ化（終値＋出来高合計）"""
@@ -83,7 +97,6 @@ def to_daily(df):
     )
     daily["time"] = pd.to_datetime(daily["date"]).dt.tz_localize(JST)
     return daily[["time", "value", "volume"]].sort_values("time")
-
 
 def plot_chart(df, key, label):
     """価格 + 移動平均線 + 出来高"""
@@ -104,7 +117,7 @@ def plot_chart(df, key, label):
     ax2.tick_params(axis="y", colors="gray")
     ax2.set_ylim(bottom=0)
 
-    # 価格線
+    # 価格線＋SMA
     ax1.plot(df["time"], df["value"], color="#ff99cc", lw=1.6, label="Index")
     colors = ["#80d0ff", "#ffd580", "#b0ffb0"]
     for i, w in enumerate(SMA_WINDOWS):
@@ -122,7 +135,6 @@ def plot_chart(df, key, label):
     plt.close()
     log(f"saved chart: {out_png}")
 
-
 def main():
     key = os.environ.get("INDEX_KEY")
     if not key:
@@ -133,6 +145,7 @@ def main():
     if not src:
         raise SystemExit(f"ERROR: input not found under {base}")
 
+    log(f"input: {src}")
     raw = read_data(src)
     daily = to_daily(raw)
 
@@ -147,7 +160,6 @@ def main():
         sub = daily[daily["time"] >= since].copy()
         sub.to_csv(f"docs/outputs/{key}_{label}.csv", index=False)
         plot_chart(sub, key, label)
-
 
 if __name__ == "__main__":
     main()
