@@ -180,44 +180,95 @@ def apply_y_padding(ax, series):
         ax.set_ylim(ymin - pad, ymax + pad)
 
 def plot_df(df, key, label, mode):
+    """
+    df        : time,value,volume（時系列）
+    label     : '1d' / '7d' / '1m' / '1y'
+    mode      : '1d' or 'long'
+    ポイント：
+      - 線を描く前に「軽い補間＋平滑化」
+      - ラインの角丸/アンチエイリアス/重なり順を調整
+    """
     out_csv = os.path.join(OUTPUT_DIR, f"{key}_{label}.csv")
     out_png = os.path.join(OUTPUT_DIR, f"{key}_{label}.png")
     df[["time","value","volume"]].to_csv(out_csv, index=False)
 
-    fig, ax1 = plt.subplots(figsize=(9.5, 4.8))
-    ax1.grid(True, alpha=0.35)
+    # ---- 軽い補間（アップサンプリング） ----
+    # 1d   → 15分足相当（intraday想定なので過度な補間はしない）
+    # 7d   → 6時間刻み
+    # 1m   → 1日刻み（欠損は線形補間）
+    # 1y   → 3日刻み（視認性のため）
+    if not df.empty:
+        ts = df.set_index("time").sort_index()
+        if label == "1d":
+            freq = "15T"
+        elif label == "7d":
+            freq = "6H"
+        elif label == "1m":
+            freq = "1D"
+        else:  # '1y'
+            freq = "3D"
 
-    # volume
+        # 値だけ線形補間（両端は直近値で埋め）
+        ts_i = ts[["value"]].resample(freq).interpolate("time").ffill().bfill()
+        # 出来高は合計/平均どちらも不自然なのでそのまま（棒グラフは元の点数でOK）
+        # 描画用に結合
+        df_line = ts_i.reset_index().rename(columns={"index":"time"})
+        # なめらかにするため軽い移動平均（3点）
+        df_line["value"] = df_line["value"].rolling(window=3, center=True, min_periods=1).mean()
+    else:
+        df_line = df.copy()
+
+    # ---- 描画 ----
+    fig, ax1 = plt.subplots(figsize=(9.5, 4.8))
+    ax1.grid(True, alpha=0.30)
+
+    # volume（全ゼロなら非表示）
     has_vol = (df["volume"].fillna(0).abs().sum() > 0)
     ax2 = None
     if has_vol:
         ax2 = ax1.twinx()
-        ax2.bar(df["time"], df["volume"], width=0.9 if mode=="1d" else 0.8,
-                color=COLOR_VOLUME, alpha=0.28, label="Volume")
+        ax2.bar(df["time"], df["volume"],
+                width=0.9 if mode=="1d" else 0.8,
+                color=COLOR_VOLUME, alpha=0.25, label="Volume", zorder=1)
         ax2.set_ylabel("Volume")
 
-    # price + SMA
-    if not df.empty:
-        ax1.plot(df["time"], df["value"], color=COLOR_PRICE, lw=1.8 if mode=="1d" else 1.6, label="Index")
+    # 価格線（角丸＋アンチエイリアス）
+    lw_main = 2.0 if mode=="1d" else 1.8
+    if not df_line.empty:
+        ax1.plot(df_line["time"], df_line["value"],
+                 color=COLOR_PRICE, lw=lw_main, label="Index",
+                 solid_capstyle="round", solid_joinstyle="round",
+                 antialiased=True, zorder=3)
+
+        # SMA は元の時系列で計算 → 同様に補間・軽平滑
         for i, w in enumerate(SMA_WINDOWS):
-            s = df["value"].rolling(window=w, min_periods=1).mean()
-            ax1.plot(df["time"], s, lw=1.1, color=COLOR_SMA[i], label=f"SMA{w}")
+            s = df.set_index("time")["value"].rolling(window=w, min_periods=1).mean()
+            s_i = s.resample(freq).interpolate("time").ffill().bfill()
+            s_i = s_i.rolling(window=3, center=True, min_periods=1).mean()
+            ax1.plot(s_i.index, s_i.values,
+                     lw=1.2, color=COLOR_SMA[i], label=f"SMA{w}",
+                     solid_capstyle="round", solid_joinstyle="round",
+                     antialiased=True, zorder=2)
 
     ax1.set_title(f"{key.upper()} ({label})", color="#ffb6c1", pad=10)
     ax1.set_xlabel("Date"); ax1.set_ylabel("Index Value")
-    format_time_axis(ax1, mode)
-    apply_y_padding(ax1, df["value"] if not df.empty else [0])
 
-    # legend merge
+    # 軸フォーマット & 余白
+    format_time_axis(ax1, mode if label=="1d" else "long")
+    apply_y_padding(ax1, df_line["value"] if not df_line.empty else [0])
+
+    # 凡例併合（枠なし）
     h1,l1 = ax1.get_legend_handles_labels()
     h2,l2 = (ax2.get_legend_handles_labels() if ax2 else ([],[]))
     if h1 or h2:
-        ax1.legend(h1+h2, l1+l2, loc="upper left", frameon=False)
+        leg = ax1.legend(h1+h2, l1+l2, loc="upper left", frameon=False)
+        for t in leg.get_texts(): t.set_color("#e5ecff")
 
     plt.tight_layout()
-    plt.savefig(out_png, dpi=160)
+    plt.savefig(out_png, dpi=180)  # ちょい高解像度
     plt.close()
     log(f"saved: {os.path.basename(out_png)}")
+
 
 # ---------- メイン ----------
 def main():
