@@ -224,16 +224,7 @@ def main():
             log(f"{label}: no data; used last daily point")
         plot_df(sub, key, label, "long")
 
-    # 互換：1日PNGを intraday 名でも出力（ポータルの1日タブ用）
-    try:
-        import shutil
-        src = f"docs/outputs/{key}_1d.png"
-        dst = f"docs/outputs/{key}_intraday.png"
-        if os.path.exists(src):
-            shutil.copyfile(src, dst)
-            log(f"copied: {src} -> {dst}")
-    except Exception as e:
-        log(f"copy intraday alias failed: {e}")
+ 
 
 if __name__ == "__main__":
     main()
