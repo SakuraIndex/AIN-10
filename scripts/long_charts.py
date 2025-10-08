@@ -8,7 +8,6 @@ import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 
-# ========= 指数ごとの入出力タイムゾーンと市場時間 =========
 INDEX_KEY = os.environ.get("INDEX_KEY", "").strip()
 if not INDEX_KEY:
     raise SystemExit("ERROR: INDEX_KEY not set")
@@ -16,17 +15,13 @@ if not INDEX_KEY:
 def market_profile(index_key: str):
     k = index_key.lower()
     if k == "ain10":
-        # 入力: JST（CSVがJSTで生成されている想定）
-        # 表示: JST（日本時間で見せる）
-        # セッション: 米国市場の時間（ET 09:30–16:00）→ 後でJSTに変換して枠固定
         return dict(
-            RAW_TZ="Asia/Tokyo",
-            DISPLAY_TZ="Asia/Tokyo",
-            SESSION_TZ="America/New_York",
+            RAW_TZ="Asia/Tokyo",      # 入力(JST)
+            DISPLAY_TZ="Asia/Tokyo",  # 表示(JST)
+            SESSION_TZ="America/New_York",  # セッション(ET)
             SESSION_START=(9,30),
             SESSION_END=(16,0),
         )
-    # 既定: 日本市場を想定（必要なら増やしてください）
     return dict(
         RAW_TZ="Asia/Tokyo",
         DISPLAY_TZ="Asia/Tokyo",
@@ -37,7 +32,6 @@ def market_profile(index_key: str):
 
 MP = market_profile(INDEX_KEY)
 
-# ========= 見た目 =========
 plt.rcParams.update({
     "font.family": "Noto Sans CJK JP",
     "figure.facecolor": "#0b0f1a",
@@ -56,7 +50,6 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 def log(m): print("[long_charts]", m)
 
-# ========= ファイル検出 =========
 def _first(paths):
     for p in paths:
         if os.path.exists(p): return p
@@ -70,20 +63,15 @@ def find_history(base, key):
     p = _first([f"{base}/{key}_history.csv", f"{base}/{key}_history.txt"])
     return p or (sorted(glob.glob(f"{base}/*_history.csv"))[:1] or [None])[0]
 
-# ========= 解析 =========
 def parse_time_any(x, raw_tz: str, display_tz: str):
     if pd.isna(x): return pd.NaT
     s = str(x)
-    # 10桁Unix秒
     if re.fullmatch(r"\d{10}", s):
         return pd.Timestamp(int(s), unit="s", tz="UTC").tz_convert(display_tz)
-    # 文字列 → RAW_TZ として読み、表示TZへ変換
     try:
         t = pd.to_datetime(s, utc=False)
-        if t.tzinfo is None:
-            t = t.tz_localize(raw_tz)
-        else:
-            t = t.tz_convert(raw_tz)
+        if t.tzinfo is None: t = t.tz_localize(raw_tz)
+        else:                t = t.tz_convert(raw_tz)
         return t.tz_convert(display_tz)
     except Exception:
         return pd.NaT
@@ -133,7 +121,6 @@ def to_daily(df: pd.DataFrame, display_tz: str) -> pd.DataFrame:
     g["time"] = pd.to_datetime(g["date"]).dt.tz_localize(display_tz)
     return g[["time","value","volume"]].sort_values("time").reset_index(drop=True)
 
-# ========= 表示ユーティリティ =========
 def format_time_axis(ax, mode, tz):
     if mode == "1d":
         ax.xaxis.set_major_locator(mdates.HourLocator(interval=1, tz=tz))
@@ -157,11 +144,6 @@ def apply_y_padding(ax, s):
 def et_session_to_jst_frame(last_ts_jst: pd.Timestamp,
                             session_tz: str, display_tz: str,
                             start_hm, end_hm):
-    """
-    last_ts_jst: 表示TZ(JST)の最後の時刻
-    米国(ET)のその日のセッション(09:30–16:00)を作り、JSTに変換して返す。
-    """
-    # 最後のデータの「米国カレンダー日」を求める
     last_et = last_ts_jst.tz_convert(session_tz)
     et_date = last_et.date()
     start_et = pd.Timestamp(et_date.year, et_date.month, et_date.day,
@@ -219,7 +201,6 @@ def plot_df(df: pd.DataFrame, key: str, label: str, mode: str, tz: str, frame=No
     plt.close()
     log(f"saved: {key}_{label}.png")
 
-# ========= メイン =========
 def main():
     raw_tz     = MP["RAW_TZ"]
     display_tz = MP["DISPLAY_TZ"]
@@ -235,25 +216,27 @@ def main():
 
     daily_all = to_daily(history if not history.empty else intraday, display_tz)
 
-    # --- 1d（表示はJST、枠はETセッションをJSTへ変換して固定） ---
+    # ---------- 1d: フレームで切り出し（跨ぎ日対応） ----------
     frame = None
     if not intraday.empty:
-        last_ts = intraday["time"].max()  # 既に DISPLAY_TZ(JST)
-        # ％→絶対値補正（必要な場合）
-        last_day = last_ts.tz_convert(display_tz).date()
-        df_1d = intraday[intraday["time"].dt.date == last_day].copy()
-        prev = daily_all[daily_all["time"].dt.date < last_day].tail(1)
+        last_ts = intraday["time"].max()  # JST
+        # ETセッションをJSTへ変換して枠を作る
+        start_jst, end_jst = et_session_to_jst_frame(last_ts, session_tz, display_tz, start_hm, end_hm)
+        frame = (start_jst, end_jst)
+        # ☆ ここが重要：日付一致ではなく、フレームで切る
+        mask = (intraday["time"] >= start_jst) & (intraday["time"] <= end_jst)
+        df_1d = intraday.loc[mask].copy()
+
+        # %→絶対値補正（必要な場合）。基準はフレーム開始より前の最新日足
+        prev = daily_all[daily_all["time"] < start_jst].tail(1)
         base = float(prev["value"].iloc[0]) if not prev.empty else None
-        # 軽い%判定
         if not df_1d.empty:
             s = pd.to_numeric(df_1d["value"], errors="coerce").abs()
             if s.max() <= 20.0 and base and base > 50:
                 df_1d["value"] = base * (1.0 + df_1d["value"]/100.0)
                 log(f"converted 1d % -> absolute (base={base:.4f})")
-        # フレーム：ETセッションをJSTに変換
-        start_jst, end_jst = et_session_to_jst_frame(last_ts, session_tz, display_tz, start_hm, end_hm)
-        frame = (start_jst, end_jst)
-        log(f"1d frame JST: {start_jst} ~ {end_jst} (from ET {start_hm}-{end_hm})")
+
+        log(f"1d frame JST: {start_jst} ~ {end_jst}  rows={len(df_1d)}")
     else:
         df_1d = pd.DataFrame(columns=["time","value","volume"])
 
@@ -269,7 +252,7 @@ def main():
 
     plot_df(df_1d, INDEX_KEY, "1d", "1d", display_tz, frame=frame)
 
-    # --- 7d / 1m / 1y（JST表示のまま） ---
+    # ---------- 7d / 1m / 1y ----------
     now = pd.Timestamp.now(tz=display_tz)
     for label, days in [("7d",7), ("1m",31), ("1y",365)]:
         sub = daily_all[daily_all["time"] >= (now - timedelta(days=days))].copy()
