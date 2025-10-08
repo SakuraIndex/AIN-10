@@ -1,9 +1,9 @@
-name: Generate long-term charts (price + volume + SMA)
+name: Generate long-term charts (AIN-10: price + volume + SMA)
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: '40 6 * * *'  # JST 15:40
+    - cron: '35 21 * * *'  # JST 06:35 に合わせたスケジュール（UTC）
 
 permissions:
   contents: write
@@ -12,7 +12,7 @@ jobs:
   build:
     runs-on: ubuntu-latest
     env:
-      INDEX_KEY: astra4  # 各リポで変更（astra4 / scoin_plus / rbank9 / ain10）
+      INDEX_KEY: ain10  # ← ファイル名に合わせて小文字・ハイフンなし
     steps:
       - uses: actions/checkout@v4
 
@@ -25,13 +25,19 @@ jobs:
         run: |
           pip install pandas matplotlib
 
-      - name: Generate charts (7d/1m/1y)
-        run: python scripts/long_charts.py
+      - name: Sanity check
+        run: |
+          echo "INDEX_KEY=$INDEX_KEY"
+          ls -al docs/outputs || true
+
+      - name: Generate long-term charts (7d/1m/1y)
+        run: |
+          python scripts/long_charts.py
 
       - name: Commit charts if changed
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
-          commit_message: "chore(charts): update long-term charts with SMA & volume"
+          commit_message: "chore(charts): update AIN-10 long-term charts (SMA & volume)"
           file_pattern: |
             docs/outputs/*_7d.png
             docs/outputs/*_1m.png
