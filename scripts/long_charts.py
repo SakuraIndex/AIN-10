@@ -2,15 +2,13 @@
 # -*- coding: utf-8 -*-
 
 import os, re, glob
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 
 # ====== 可変：指数ごとのローカル市場タイムゾーンと取引時間 ======
-# AIN-10 は米国株 → ET（09:30-16:00）
-# それ以外は既存どおり JST（09:00-15:00 にしたい場合は必要に応じて変更ください）
 INDEX_KEY = os.environ.get("INDEX_KEY", "").strip()
 if not INDEX_KEY:
     raise SystemExit("ERROR: INDEX_KEY not set")
@@ -18,8 +16,7 @@ if not INDEX_KEY:
 def market_profile(index_key: str):
     if index_key.lower() == "ain10":
         return ("America/New_York", (9, 30), (16, 0))  # ET
-    # ここで他指数の市場を追加可能
-    return ("Asia/Tokyo", (9, 0), (15, 0))            # デフォルトJST
+    return ("Asia/Tokyo", (9, 0), (15, 0))             # デフォルト
 
 TZ_NAME, SESSION_START, SESSION_END = market_profile(INDEX_KEY)
 
@@ -70,17 +67,17 @@ def find_history(base, key):
     return gl[0] if gl else None
 
 # ====== 日時・列検出 ======
-def parse_time_any(x, tz):
+def parse_time_any(x, tz_name: str):
     if pd.isna(x): return pd.NaT
     s = str(x)
     if re.fullmatch(r"\d{10}", s):
-        return pd.Timestamp(int(s), unit="s", tz="UTC").tz_convert(tz)
+        return pd.Timestamp(int(s), unit="s", tz="UTC").tz_convert(tz_name)
     try:
         t = pd.to_datetime(s, utc=False)
         if t.tzinfo is None:
-            t = t.tz_localize(tz)
+            t = t.tz_localize(tz_name)
         else:
-            t = t.tz_convert(tz)
+            t = t.tz_convert(tz_name)
         return t
     except Exception:
         return pd.NaT
@@ -88,8 +85,7 @@ def parse_time_any(x, tz):
 def pick_value_column(df: pd.DataFrame) -> str:
     cols = [c.lower().strip() for c in df.columns]
     df.columns = cols
-    priority = ["close","price","value","index","終値","last","adjclose"]
-    for k in priority:
+    for k in ["close","price","value","index","終値","last","adjclose"]:
         if k in df.columns and pd.api.types.is_numeric_dtype(df[k]):
             return k
     numeric = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
@@ -114,7 +110,7 @@ def pick_volume_column(df: pd.DataFrame):
             return k
     return None
 
-def normalize_df(path: str, tz) -> pd.DataFrame:
+def normalize_df(path: str, tz_name: str) -> pd.DataFrame:
     df = pd.read_csv(path)
     raw_cols = df.columns.tolist()
     df.columns = [str(c).lower().strip() for c in df.columns]
@@ -125,7 +121,7 @@ def normalize_df(path: str, tz) -> pd.DataFrame:
     volcol = pick_volume_column(df)
 
     out = pd.DataFrame()
-    out["time"]   = df[tcol].apply(lambda x: parse_time_any(x, tz))
+    out["time"]   = df[tcol].apply(lambda x: parse_time_any(x, tz_name))
     out["value"]  = pd.to_numeric(df[vcol], errors="coerce")
     out["volume"] = pd.to_numeric(df[volcol], errors="coerce") if volcol else 0
     out = out.replace([np.inf, -np.inf], np.nan).dropna(subset=["time","value"])
@@ -133,21 +129,21 @@ def normalize_df(path: str, tz) -> pd.DataFrame:
     log(f"read: {os.path.basename(path)} cols={raw_cols} -> time={tcol}, value={vcol}, volume={volcol or 'NONE'} rows={len(out)}")
     return out
 
-def to_daily(df: pd.DataFrame, tz) -> pd.DataFrame:
+def to_daily(df: pd.DataFrame, tz_name: str) -> pd.DataFrame:
     if df.empty: return df.copy()
     d = df.copy()
-    d["date"] = d["time"].dt.tz_convert(tz).dt.date
+    d["date"] = d["time"].dt.tz_convert(tz_name).dt.date
     g = d.groupby("date", as_index=False).agg({"value":"last","volume":"sum"})
-    g["time"] = pd.to_datetime(g["date"]).dt.tz_localize(tz)
+    g["time"] = pd.to_datetime(g["date"]).dt.tz_localize(tz_name)
     return g[["time","value","volume"]].sort_values("time").reset_index(drop=True)
 
 # ====== 軸・レンジ ======
-def format_time_axis(ax, mode, tz):
+def format_time_axis(ax, mode, tz_name):
     if mode == "1d":
-        ax.xaxis.set_major_locator(mdates.HourLocator(interval=1, tz=tz))
-        ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M", tz=tz))
+        ax.xaxis.set_major_locator(mdates.HourLocator(interval=1, tz=tz_name))
+        ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M", tz=tz_name))
     else:
-        loc = mdates.AutoDateLocator(minticks=3, maxticks=6, tz=tz)
+        loc = mdates.AutoDateLocator(minticks=3, maxticks=6, tz=tz_name)
         ax.xaxis.set_major_locator(loc)
         ax.xaxis.set_major_formatter(mdates.ConciseDateFormatter(loc))
 
@@ -164,9 +160,10 @@ def apply_y_padding(ax, series):
         pad = span * 0.08
         ax.set_ylim(ymin - pad, ymax + pad)
 
-def session_bounds(day, tz, start_hm, end_hm):
-    start = pd.Timestamp(day.year, day.month, day.day, start_hm[0], start_hm[1], tz=tz)
-    end   = pd.Timestamp(day.year, day.month, day.day, end_hm[0], end_hm[1], tz=tz)
+def session_bounds(day_ts: pd.Timestamp, tz_name: str, start_hm, end_hm):
+    """day_ts は tz付き Timestamp（日付だけ使う）。"""
+    start = pd.Timestamp(day_ts.year, day_ts.month, day_ts.day, start_hm[0], start_hm[1], tz=tz_name)
+    end   = pd.Timestamp(day_ts.year, day_ts.month, day_ts.day, end_hm[0],   end_hm[1],   tz=tz_name)
     return start, end
 
 # ====== ％→絶対値（必要時のみ） ======
@@ -185,7 +182,7 @@ def maybe_percent_to_absolute(df_1d: pd.DataFrame, base_value: float) -> pd.Data
     return df_1d
 
 # ====== 描画 ======
-def plot_df(df: pd.DataFrame, key: str, label: str, mode: str, tz, frame_limits=None):
+def plot_df(df: pd.DataFrame, key: str, label: str, mode: str, tz_name: str, frame_limits=None):
     out_csv = os.path.join(OUTPUT_DIR, f"{key}_{label}.csv")
     out_png = os.path.join(OUTPUT_DIR, f"{key}_{label}.png")
     df[["time","value","volume"]].to_csv(out_csv, index=False)
@@ -206,7 +203,7 @@ def plot_df(df: pd.DataFrame, key: str, label: str, mode: str, tz, frame_limits=
     if df_line.empty:
         base = df.dropna(subset=["value"]).tail(1)
         last_v = float(base["value"].values[0]) if not base.empty else 0.0
-        now = pd.Timestamp.now(tz=tz)
+        now = pd.Timestamp.now(tz=tz_name)
         df_line = pd.DataFrame({"time":[now - pd.Timedelta(hours=1), now],
                                 "value":[last_v, last_v]})
 
@@ -228,10 +225,9 @@ def plot_df(df: pd.DataFrame, key: str, label: str, mode: str, tz, frame_limits=
 
     ax1.set_title(f"{key.upper()} ({label})", color="#ffb6c1", pad=10)
     ax1.set_xlabel("Time" if mode=="1d" else "Date"); ax1.set_ylabel("Index Value")
-    format_time_axis(ax1, mode if label=="1d" else "long", tz)
+    format_time_axis(ax1, mode if label=="1d" else "long", tz_name)
     apply_y_padding(ax1, df_line["value"])
 
-    # 取引時間に枠を合わせる（1d のみ）
     if frame_limits is not None:
         ax1.set_xlim(frame_limits[0], frame_limits[1])
 
@@ -248,7 +244,7 @@ def plot_df(df: pd.DataFrame, key: str, label: str, mode: str, tz, frame_limits=
 
 # ====== メイン ======
 def main():
-    tz = TZ_NAME  # 例: "America/New_York" or "Asia/Tokyo"
+    tz = TZ_NAME  # 例: "America/New_York" / "Asia/Tokyo"
 
     intraday_p = find_intraday(OUTPUT_DIR, INDEX_KEY)
     history_p  = find_history(OUTPUT_DIR, INDEX_KEY)
@@ -256,31 +252,28 @@ def main():
     intraday = normalize_df(intraday_p, tz) if intraday_p else pd.DataFrame(columns=["time","value","volume"])
     history  = normalize_df(history_p,  tz) if history_p  else pd.DataFrame(columns=["time","value","volume"])
 
-    # 日足（7d/1m/1y と 1dの前日終値計算に使用）
     daily_all = to_daily(history if not history.empty else intraday, tz)
 
-    # --- 1日：ローカルTZの最終日＆米国市場は 09:30–16:00 に合わせる ---
+    # --- 1d：ローカルTZの最終日・米国市場は 09:30–16:00 に枠固定 ---
+    frame = None
     if not intraday.empty:
         last_day = intraday["time"].dt.tz_convert(tz).dt.date.max()
         df_1d = intraday[intraday["time"].dt.tz_convert(tz).dt.date == last_day].copy()
         prev = daily_all[daily_all["time"].dt.date < last_day].tail(1)
         base_value = float(prev["value"].iloc[0]) if not prev.empty else None
         df_1d = maybe_percent_to_absolute(df_1d, base_value)
-        # フレームを市場時間に固定
-        s, e = session_bounds(pd.Timestamp(last_day, tz=tz), pd.Timestamp.tzname, SESSION_START, SESSION_END)
-        # 上の関数は署名の都合で tz を処理しづらいので直接再計算
-        start = pd.Timestamp(last_day.year, last_day.month, last_day.day, SESSION_START[0], SESSION_START[1], tz=tz)
-        end   = pd.Timestamp(last_day.year, last_day.month, last_day.day, SESSION_END[0],   SESSION_END[1],   tz=tz)
+
+        # 枠を市場時間に合わせる
+        day_ts = pd.Timestamp(last_day, tz=tz)
+        start, end = session_bounds(day_ts, tz, SESSION_START, SESSION_END)
         frame = (start, end)
         log(f"1d frame: {start} ~ {end} ({TZ_NAME})")
     else:
         df_1d = pd.DataFrame(columns=["time","value","volume"])
-        frame = None
 
     if df_1d.empty:
         last = daily_all.tail(1)
         if not last.empty:
-            # フォールバック水平線
             now = pd.Timestamp.now(tz=tz)
             df_1d = pd.DataFrame({"time":[now - pd.Timedelta(hours=6), now],
                                   "value":[float(last["value"].iloc[0])]*2,
