@@ -27,6 +27,7 @@ COLOR_VOLUME = "#7f8ca6"
 OUTPUT_DIR = "docs/outputs"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
+# 各リポのActionsで渡す（例：ain10 / astra4 / scoin_plus / rbank9）
 INDEX_KEY = os.environ.get("INDEX_KEY", "").strip()
 if not INDEX_KEY:
     raise SystemExit("ERROR: INDEX_KEY not set")
@@ -77,12 +78,14 @@ def pick_value_column(df: pd.DataFrame) -> str:
     cols = [c.lower().strip() for c in df.columns]
     df.columns = cols
     priority = [
+        # 価格系の優先候補
         "close","price","value","index","終値","last","adjclose",
         INDEX_KEY, INDEX_KEY.replace("_",""), INDEX_KEY.split("_")[0]
     ]
     for k in priority:
         if k in df.columns and pd.api.types.is_numeric_dtype(df[k]):
             return k
+    # 数値列から最も変動が大きいもの
     numeric = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
     if len(numeric) == 1:
         return numeric[0]
@@ -97,9 +100,7 @@ def pick_value_column(df: pd.DataFrame) -> str:
     return max(span, key=span.get)
 
 def pick_volume_column(df: pd.DataFrame):
-    """
-    出来高候補の列名を広めに拾う
-    """
+    """出来高候補の列名を広めに拾う"""
     cols = [c.lower().strip() for c in df.columns]
     df.columns = cols
     candidates = [
@@ -162,13 +163,34 @@ def apply_y_padding(ax, series):
         pad = span * 0.08
         ax.set_ylim(ymin - pad, ymax + pad)
 
+# ====== ヘルパ：％値の可能性を判定して絶対値に変換 ======
+def maybe_percent_to_absolute(df_1d: pd.DataFrame, base_value: float) -> pd.DataFrame:
+    """
+    intradayが ±数％ っぽい値なら、前日終値 base_value を用いて
+    絶対値へ変換（base * (1 + pct/100)）。
+    """
+    if df_1d.empty or base_value is None:
+        return df_1d
+    s = pd.to_numeric(df_1d["value"], errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
+    if s.empty:
+        return df_1d
+    vmax = float(s.abs().max())
+    vmean = float(s.abs().mean())
+    # だいたい±20%以内なら％とみなす（指数レベルが100超なら特に安全）
+    if vmax <= 20.0 and base_value > 50:
+        out = df_1d.copy()
+        out["value"] = base_value * (1.0 + (out["value"] / 100.0))
+        log(f"1d values looked like percentage; converted using base={base_value:.4f}")
+        return out
+    return df_1d
+
 # ====== 描画（価格ライン＋出来高） ======
 def plot_df(df: pd.DataFrame, key: str, label: str, mode: str):
     out_csv = os.path.join(OUTPUT_DIR, f"{key}_{label}.csv")
     out_png = os.path.join(OUTPUT_DIR, f"{key}_{label}.png")
     df[["time","value","volume"]].to_csv(out_csv, index=False)
 
-    # ---- 価格ライン用に軽い補間＆平滑 ----
+    # ---- 線をなめらかに（価格のみ補間＋軽平滑） ----
     if not df.empty:
         ts = df.set_index("time").sort_index()
         freq = {"1d":"15T", "7d":"6H", "1m":"1D", "1y":"3D"}.get(label, "1D")
@@ -199,9 +221,10 @@ def plot_df(df: pd.DataFrame, key: str, label: str, mode: str):
     ax2 = None
     if has_vol:
         ax2 = ax1.twinx()
-        ax2.bar(df["time"], df["volume"],
-                width=0.9 if mode=="1d" else 0.8,
-                color=COLOR_VOLUME, alpha=0.27, label="Volume", zorder=1)
+        # 棒幅はおおまかに時系列密度に合わせる
+        width = 0.9 if mode=="1d" else 0.8
+        ax2.bar(df["time"], df["volume"], width=width, color=COLOR_VOLUME, alpha=0.35,
+                label="Volume", zorder=1)
         ax2.set_ylabel("Volume")
 
     lw_main = 2.0 if mode=="1d" else 1.8
@@ -211,7 +234,8 @@ def plot_df(df: pd.DataFrame, key: str, label: str, mode: str):
              antialiased=True, label="Index", zorder=3)
 
     ax1.set_title(f"{key.upper()} ({label})", color="#ffb6c1", pad=10)
-    ax1.set_xlabel("Date"); ax1.set_ylabel("Index Value")
+    ax1.set_xlabel("Date" if mode!="1d" else "Time")
+    ax1.set_ylabel("Index Value")
     format_time_axis(ax1, mode if label=="1d" else "long")
     apply_y_padding(ax1, df_line["value"])
 
@@ -235,19 +259,24 @@ def main():
     intraday = normalize_df(intraday_p) if intraday_p else pd.DataFrame(columns=["time","value","volume"])
     history  = normalize_df(history_p)  if history_p  else pd.DataFrame(columns=["time","value","volume"])
 
-    # --- 1日（当日のデータで抽出：横線防止の本修正） ---
-    # 実行時刻ではなく「intraday の最新日」を 1日分抽出する
+    # 日足データ（7d/1m/1y用 & 1dのベース推定に使用）
+    daily_all = to_daily(history if not history.empty else intraday)
+
+    # --- 1日（最新日を抽出し、％→絶対値に自動補正） ---
     if not intraday.empty:
         last_day = intraday["time"].dt.tz_convert(JST).dt.date.max()
         df_1d = intraday[intraday["time"].dt.tz_convert(JST).dt.date == last_day].copy()
         log(f"1d extracted by last data day: {last_day} rows={len(df_1d)}")
+        # 前日終値（最新日の前日）をベースに％→絶対値へ
+        prev = daily_all[daily_all["time"].dt.date < last_day].tail(1)
+        base_value = float(prev["value"].iloc[0]) if not prev.empty else None
+        df_1d = maybe_percent_to_absolute(df_1d, base_value)
     else:
         df_1d = pd.DataFrame(columns=["time","value","volume"])
 
     if df_1d.empty:
-        # フォールバック：最後の終値で水平線
-        daily = to_daily(history if not history.empty else intraday)
-        last = daily.tail(1)
+        # フォールバック：水平線
+        last = daily_all.tail(1)
         if not last.empty:
             now = datetime.now(tz=JST)
             t0, t1 = now - timedelta(hours=6), now
@@ -259,14 +288,13 @@ def main():
             log("1d fallback: used last daily value")
     plot_df(df_1d, INDEX_KEY, "1d", "1d")
 
-    # --- 7d/1m/1y（履歴ベースの集計） ---
-    daily = to_daily(history if not history.empty else intraday)
+    # --- 7d/1m/1y（履歴ベース） ---
     now = datetime.now(tz=JST)
     for label, days in [("7d",7), ("1m",31), ("1y",365)]:
         since = now - timedelta(days=days)
-        sub = daily[daily["time"] >= since].copy()
-        if sub.empty and not daily.empty:
-            sub = daily.tail(1).copy()
+        sub = daily_all[daily_all["time"] >= since].copy()
+        if sub.empty and not daily_all.empty:
+            sub = daily_all.tail(1).copy()
             log(f"{label} fallback: last daily point only")
         plot_df(sub, INDEX_KEY, label, "long")
 
