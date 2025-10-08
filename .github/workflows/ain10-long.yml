@@ -1,0 +1,48 @@
+name: AIN-10 Long Charts (manual + daily)
+
+on:
+  workflow_dispatch:    # ← これがあると「Run workflow」が出ます
+  schedule:
+    - cron: '35 21 * * *'   # UTC 21:35 = JST 06:35（AIN-10更新に合わせる）
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      INDEX_KEY: ain10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install pandas matplotlib
+
+      - name: Sanity check
+        run: |
+          echo "INDEX_KEY=$INDEX_KEY"
+          ls -al docs/outputs || true
+
+      - name: Generate long-term charts
+        run: |
+          python scripts/long_charts.py
+
+      - name: Commit charts if changed
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "chore(charts): update AIN-10 long-term charts (SMA & volume)"
+          file_pattern: |
+            docs/outputs/*_7d.png
+            docs/outputs/*_1m.png
+            docs/outputs/*_1y.png
+            docs/outputs/*_7d.csv
+            docs/outputs/*_1m.csv
+            docs/outputs/*_1y.csv
