@@ -1,9 +1,9 @@
 name: AIN-10 Long Charts (manual + daily)
 
 on:
-  workflow_dispatch:    # ← これがあると「Run workflow」が出ます
+  workflow_dispatch:
   schedule:
-    - cron: '35 21 * * *'   # UTC 21:35 = JST 06:35（AIN-10更新に合わせる）
+    - cron: '35 21 * * *'   # UTC 21:35 = JST 06:35
 
 permissions:
   contents: write
@@ -26,14 +26,31 @@ jobs:
         run: |
           pip install pandas matplotlib
 
-      - name: Sanity check
+      - name: List BEFORE
         run: |
           echo "INDEX_KEY=$INDEX_KEY"
+          echo "----- BEFORE -----"
           ls -al docs/outputs || true
 
       - name: Generate long-term charts
         run: |
           python scripts/long_charts.py
+
+      - name: List AFTER
+        run: |
+          echo "----- AFTER -----"
+          ls -al docs/outputs || true
+          echo "----- GIT STATUS -----"
+          git status --porcelain
+
+      - name: Upload artifacts (for debug)
+        uses: actions/upload-artifact@v4
+        with:
+          name: ain10-longcharts
+          path: |
+            docs/outputs/*_7d.*
+            docs/outputs/*_1m.*
+            docs/outputs/*_1y.*
 
       - name: Commit charts if changed
         uses: stefanzweifel/git-auto-commit-action@v5
