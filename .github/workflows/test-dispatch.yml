@@ -1,0 +1,10 @@
+name: TEST manual dispatch only
+
+on:
+  workflow_dispatch:  # ← この1行が正しく解釈されれば「Run workflow」が必ず出ます
+
+jobs:
+  say_hello:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "Dispatch works"
