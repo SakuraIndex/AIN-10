@@ -1,9 +1,9 @@
 name: Generate long-term charts (AIN-10: price + volume + SMA)
 
 on:
-  workflow_dispatch:   # ✅ ← これがあると「Run workflow」ボタンが出る
+  workflow_dispatch:   # ✅ 手動実行ボタン用
   schedule:
-    - cron: '35 21 * * *'  # JST 06:35
+    - cron: '35 21 * * *'  # ✅ 毎日 UTC 21:35 = JST 06:35
 
 permissions:
   contents: write
@@ -12,7 +12,7 @@ jobs:
   build:
     runs-on: ubuntu-latest
     env:
-      INDEX_KEY: ain10  # ← ファイル名に合わせて小文字・ハイフンなし
+      INDEX_KEY: ain10   # ← 入力ファイル: docs/outputs/ain10_intraday.csv に合わせる
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -26,7 +26,7 @@ jobs:
         run: |
           pip install pandas matplotlib
 
-      - name: Sanity check (ファイル確認)
+      - name: Sanity check
         run: |
           echo "INDEX_KEY=$INDEX_KEY"
           ls -al docs/outputs || true
