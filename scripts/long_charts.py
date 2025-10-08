@@ -272,16 +272,75 @@ def main():
             frame = None
             log("1d fallback: last daily value")
 
-    plot_df(df_1d, INDEX_KEY, "1d", "1d", DISPLAY_TZ, frame=frame, resample_for_1d=False)
+   def plot_df(df: pd.DataFrame, key: str, label: str, mode: str, tz: str, frame=None, resample_for_1d=False):
+    # CSV保存（デバッグ）
+    df[["time","value","volume"]].to_csv(f"{OUTPUT_DIR}/{key}_{label}.csv", index=False)
 
-    # --- 7d / 1m / 1y ---
-    now = pd.Timestamp.now(tz=DISPLAY_TZ)
-    for label, days in [("7d",7), ("1m",31), ("1y",365)]:
-        sub = daily_all[daily_all["time"] >= (now - timedelta(days=days))].copy()
-        if sub.empty and not daily_all.empty:
-            sub = daily_all.tail(1).copy()
-            log(f"{label} fallback: last daily point only")
-        plot_df(sub, INDEX_KEY, label, "long", DISPLAY_TZ)
+    # ====== 色判定（陽線・陰線） ======
+    if mode == "1d" and not df.empty:
+        open_price = float(df["value"].iloc[0])
+        close_price = float(df["value"].iloc[-1])
+        if close_price > open_price:
+            COLOR_LINE = "#00C2A0"   # 青緑（陽線）
+        elif close_price < open_price:
+            COLOR_LINE = "#FF4C4C"   # 赤（陰線）
+        else:
+            COLOR_LINE = "#CCCCCC"   # 同値ならグレー
+    else:
+        COLOR_LINE = COLOR_PRICE
 
-if __name__ == "__main__":
-    main()
+    # ====== 1d は元の分足を軽く平滑 ======
+    if mode == "1d" and not resample_for_1d:
+        line = df.copy()
+        if not line.empty:
+            line["value"] = line["value"].rolling(3, center=True, min_periods=1).mean()
+    else:
+        if not df.empty:
+            ts = df.set_index("time").sort_index()
+            freq = {"1d":"15T","7d":"6H","1m":"1D","1y":"3D"}.get(label,"1D")
+            line = ts[["value"]].resample(freq).interpolate("time").ffill().bfill().reset_index()
+            line["value"] = line["value"].rolling(3, center=True, min_periods=1).mean()
+        else:
+            line = df.copy()
+
+    if not line.empty:
+        line["value"] = pd.to_numeric(line["value"], errors="coerce").replace([np.inf,-np.inf], np.nan)
+        line = line.dropna(subset=["value"]).reset_index(drop=True)
+
+    if line.empty:
+        now = pd.Timestamp.now(tz=tz)
+        last_v = float(df["value"].tail(1).values[0]) if not df.empty else 0.0
+        line = pd.DataFrame({"time":[now - pd.Timedelta(hours=1), now],
+                             "value":[last_v,last_v]})
+
+    # ====== プロット ======
+    fig, ax1 = plt.subplots(figsize=(9.5,4.8))
+    ax1.grid(True, alpha=0.30)
+
+    df["volume"] = pd.to_numeric(df["volume"], errors="coerce").replace([np.inf,-np.inf], np.nan).fillna(0)
+    if (df["volume"].abs().sum() > 0):
+        ax2 = ax1.twinx()
+        ax2.bar(df["time"], df["volume"], width=0.9 if mode=="1d" else 0.8,
+                color=COLOR_VOLUME, alpha=0.35, zorder=1, label="Volume")
+        ax2.set_ylabel("Volume")
+
+    # ====== ライン色を切り替え ======
+    ax1.plot(line["time"], line["value"], color=COLOR_LINE, lw=2.2 if mode=="1d" else 1.8,
+             solid_capstyle="round", solid_joinstyle="round", antialiased=True,
+             label="Index", zorder=3)
+
+    ax1.set_title(f"{key.upper()} ({label})", color="#ffb6c1", pad=10)
+    ax1.set_xlabel("Time" if mode=="1d" else "Date")
+    ax1.set_ylabel("Index Value")
+    format_time_axis(ax1, mode if label=="1d" else "long", tz)
+    apply_y_padding(ax1, line["value"])
+    if frame is not None:
+        ax1.set_xlim(frame[0], frame[1])
+
+    leg = ax1.legend(loc="upper left", frameon=False)
+    for t in leg.get_texts(): t.set_color("#e5ecff")
+
+    plt.tight_layout()
+    plt.savefig(f"{OUTPUT_DIR}/{key}_{label}.png", dpi=180)
+    plt.close()
+    log(f"saved: {key}_{label}.png (color={COLOR_LINE})")
