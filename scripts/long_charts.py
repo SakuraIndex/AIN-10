@@ -27,7 +27,6 @@ COLOR_VOLUME = "#7f8ca6"
 OUTPUT_DIR = "docs/outputs"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-# 環境変数 INDEX_KEY を各リポのワークフローで渡す（例: ain10 / astra4 / scoin_plus / rbank9）
 INDEX_KEY = os.environ.get("INDEX_KEY", "").strip()
 if not INDEX_KEY:
     raise SystemExit("ERROR: INDEX_KEY not set")
@@ -75,7 +74,6 @@ def parse_time_any(x):
         return pd.NaT
 
 def pick_value_column(df: pd.DataFrame) -> str:
-    # 値列候補を自動検出
     cols = [c.lower().strip() for c in df.columns]
     df.columns = cols
     priority = [
@@ -89,16 +87,29 @@ def pick_value_column(df: pd.DataFrame) -> str:
     if len(numeric) == 1:
         return numeric[0]
     if not numeric:
-        # 何か一列でも数値変換できれば採用
         for c in df.columns:
             if pd.to_numeric(df[c], errors="coerce").notna().sum() > 0:
                 return c
         raise KeyError("No numeric column found for value")
-    # 変動が大きい列を採用
     span = {c: float(pd.to_numeric(df[c], errors="coerce").dropna().max()
                      - pd.to_numeric(df[c], errors="coerce").dropna().min())
             for c in numeric}
     return max(span, key=span.get)
+
+def pick_volume_column(df: pd.DataFrame):
+    """
+    出来高候補の列名を広めに拾う
+    """
+    cols = [c.lower().strip() for c in df.columns]
+    df.columns = cols
+    candidates = [
+        "volume","vol","qty","quantity","count","turnover","amount",
+        "出来高","出来高(千株)","売買高","出来高合計"
+    ]
+    for k in candidates:
+        if k in df.columns and pd.api.types.is_numeric_dtype(df[k]):
+            return k
+    return None
 
 def normalize_df(path: str) -> pd.DataFrame:
     df = pd.read_csv(path)
@@ -108,8 +119,7 @@ def normalize_df(path: str) -> pd.DataFrame:
     t_candidates = [c for c in df.columns if any(k in c for k in ["time","date","datetime","時刻","日付"])]
     tcol = t_candidates[0] if t_candidates else df.columns[0]
     vcol = pick_value_column(df)
-    vol_candidates = [c for c in df.columns if any(k in c for k in ["volume","vol","出来高"])]
-    volcol = vol_candidates[0] if vol_candidates else None
+    volcol = pick_volume_column(df)
 
     out = pd.DataFrame()
     out["time"]   = df[tcol].apply(parse_time_any)
@@ -152,18 +162,13 @@ def apply_y_padding(ax, series):
         pad = span * 0.08
         ax.set_ylim(ymin - pad, ymax + pad)
 
-# ====== 描画（価格ライン＋出来高のみ） ======
+# ====== 描画（価格ライン＋出来高） ======
 def plot_df(df: pd.DataFrame, key: str, label: str, mode: str):
-    """
-    df: time,value,volume（時系列）
-    label: '1d' / '7d' / '1m' / '1y'
-    mode: '1d' or 'long'
-    """
     out_csv = os.path.join(OUTPUT_DIR, f"{key}_{label}.csv")
     out_png = os.path.join(OUTPUT_DIR, f"{key}_{label}.png")
     df[["time","value","volume"]].to_csv(out_csv, index=False)
 
-    # ---- 線をなめらかにするため軽い補間＆軽平滑（価格だけ） ----
+    # ---- 価格ライン用に軽い補間＆平滑 ----
     if not df.empty:
         ts = df.set_index("time").sort_index()
         freq = {"1d":"15T", "7d":"6H", "1m":"1D", "1y":"3D"}.get(label, "1D")
@@ -199,7 +204,6 @@ def plot_df(df: pd.DataFrame, key: str, label: str, mode: str):
                 color=COLOR_VOLUME, alpha=0.27, label="Volume", zorder=1)
         ax2.set_ylabel("Volume")
 
-    # 価格ライン（SMAは描かない）
     lw_main = 2.0 if mode=="1d" else 1.8
     ax1.plot(df_line["time"], df_line["value"],
              color=COLOR_PRICE, lw=lw_main,
@@ -211,7 +215,6 @@ def plot_df(df: pd.DataFrame, key: str, label: str, mode: str):
     format_time_axis(ax1, mode if label=="1d" else "long")
     apply_y_padding(ax1, df_line["value"])
 
-    # 凡例
     h1,l1 = ax1.get_legend_handles_labels()
     h2,l2 = (ax2.get_legend_handles_labels() if ax2 else ([],[]))
     if h1 or h2:
@@ -232,15 +235,21 @@ def main():
     intraday = normalize_df(intraday_p) if intraday_p else pd.DataFrame(columns=["time","value","volume"])
     history  = normalize_df(history_p)  if history_p  else pd.DataFrame(columns=["time","value","volume"])
 
-    now = datetime.now(tz=JST)
+    # --- 1日（当日のデータで抽出：横線防止の本修正） ---
+    # 実行時刻ではなく「intraday の最新日」を 1日分抽出する
+    if not intraday.empty:
+        last_day = intraday["time"].dt.tz_convert(JST).dt.date.max()
+        df_1d = intraday[intraday["time"].dt.tz_convert(JST).dt.date == last_day].copy()
+        log(f"1d extracted by last data day: {last_day} rows={len(df_1d)}")
+    else:
+        df_1d = pd.DataFrame(columns=["time","value","volume"])
 
-    # 1d: intradayがあればそれ、なければ最後の終値で水平線
-    since_1d = now - timedelta(days=1)
-    df_1d = intraday[intraday["time"] >= since_1d].copy()
     if df_1d.empty:
+        # フォールバック：最後の終値で水平線
         daily = to_daily(history if not history.empty else intraday)
         last = daily.tail(1)
         if not last.empty:
+            now = datetime.now(tz=JST)
             t0, t1 = now - timedelta(hours=6), now
             df_1d = pd.DataFrame({
                 "time":[t0,t1],
@@ -250,8 +259,9 @@ def main():
             log("1d fallback: used last daily value")
     plot_df(df_1d, INDEX_KEY, "1d", "1d")
 
-    # 7d/1m/1y: 日足に集約
+    # --- 7d/1m/1y（履歴ベースの集計） ---
     daily = to_daily(history if not history.empty else intraday)
+    now = datetime.now(tz=JST)
     for label, days in [("7d",7), ("1m",31), ("1y",365)]:
         since = now - timedelta(days=days)
         sub = daily[daily["time"] >= since].copy()
