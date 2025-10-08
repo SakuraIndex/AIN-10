@@ -1,65 +1,74 @@
-name: AIN-10 Long Charts (manual + daily)
+name: Generate long-term charts (1d/7d/1m/1y + volume)
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: '35 21 * * *'   # UTC 21:35 = JST 06:35
+    - cron: "15 20 * * *"  # UTC 時刻。必要に応じて調整
 
 permissions:
   contents: write
 
+env:
+  # ★★ ここをリポに合わせて変更 ★★
+  INDEX_KEY: ain10   # AIN-10: ain10 / Astra4: astra4 / S-COIN+: scoin_plus / R-BANK9: rbank9
+
 jobs:
   build:
     runs-on: ubuntu-latest
-    env:
-      INDEX_KEY: ain10
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.11"
 
-      - name: Install dependencies
+      - name: Install deps
         run: |
-          pip install pandas matplotlib
-
-      - name: List BEFORE
-        run: |
-          echo "INDEX_KEY=$INDEX_KEY"
-          echo "----- BEFORE -----"
-          ls -al docs/outputs || true
+          python -m pip install --upgrade pip
+          if [ -f src/requirements.txt ]; then
+            pip install -r src/requirements.txt
+          else
+            pip install pandas numpy matplotlib
+          fi
 
       - name: Generate long-term charts
+        env:
+          INDEX_KEY: ${{ env.INDEX_KEY }}
         run: |
+          set -e
           python scripts/long_charts.py
-
-      - name: List AFTER
-        run: |
-          echo "----- AFTER -----"
+          echo "---- LIST AFTER ----"
           ls -al docs/outputs || true
-          echo "----- GIT STATUS -----"
-          git status --porcelain
 
       - name: Upload artifacts (for debug)
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: ain10-longcharts
-          path: |
-            docs/outputs/*_7d.*
-            docs/outputs/*_1m.*
-            docs/outputs/*_1y.*
+          name: outputs
+          path: docs/outputs
 
       - name: Commit charts if changed
-        uses: stefanzweifel/git-auto-commit-action@v5
-        with:
-          commit_message: "chore(charts): update AIN-10 long-term charts (SMA & volume)"
-          file_pattern: |
-            docs/outputs/*_7d.png
-            docs/outputs/*_1m.png
-            docs/outputs/*_1y.png
-            docs/outputs/*_7d.csv
-            docs/outputs/*_1m.csv
-            docs/outputs/*_1y.csv
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # ★ 4枚＋CSVを確実にステージング（INDEX_KEYごとに）
+          git add docs/outputs/${{ env.INDEX_KEY }}_1d.png    || true
+          git add docs/outputs/${{ env.INDEX_KEY }}_7d.png    || true
+          git add docs/outputs/${{ env.INDEX_KEY }}_1m.png    || true
+          git add docs/outputs/${{ env.INDEX_KEY }}_1y.png    || true
+          git add docs/outputs/${{ env.INDEX_KEY }}_1d.csv    || true
+          git add docs/outputs/${{ env.INDEX_KEY }}_7d.csv    || true
+          git add docs/outputs/${{ env.INDEX_KEY }}_1m.csv    || true
+          git add docs/outputs/${{ env.INDEX_KEY }}_1y.csv    || true
+
+          if git diff --cached --quiet; then
+            echo "No chart updates."
+            exit 0
+          fi
+
+          git commit -m "chore(charts): update ${{ env.INDEX_KEY }} 1d/7d/1m/1y"
+          git push
