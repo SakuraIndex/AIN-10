@@ -1,11 +1,10 @@
 # scripts/long_charts.py
 # -*- coding: utf-8 -*-
 """
-Generate long-term charts (1d / 7d / 1m / 1y) for INDEX_KEY
-with auto coloring (Up=GREEN / Down=RED).
+Generate long-term charts (1d / 7d / 1m / 1y) for INDEX_KEY.
 
 Inputs
-- docs/outputs/<index>_intraday.csv  (columns: time,value[,volume] OR wide-by-tickers)
+- docs/outputs/<index>_intraday.csv  (columns: time,value[,volume] or wide-plate by tickers)
 - docs/outputs/<index>_history.csv   (columns: date,value)
 
 Outputs
@@ -24,21 +23,21 @@ import pytz
 import matplotlib
 import matplotlib.pyplot as plt
 
-# === Constants ===
+# --- Theme / constants -------------------------------------------------------
 JP_TZ = pytz.timezone("Asia/Tokyo")
-SESSION_START = "09:00"
-SESSION_END   = "15:30"
+
+# clamp は AIN-10 では既定で無効（必要ならワークフローで環境変数を渡す）
+CLAMP_SESSION = (os.getenv("CLAMP_SESSION", "").lower() in {"1", "true", "yes"})
+SESSION_START = os.getenv("SESSION_START_JST")  # 例 "09:00"
+SESSION_END   = os.getenv("SESSION_END_JST")    # 例 "15:30"
 
 # Dark theme
 BG = "#0E1117"
 FG = "#E6E6E6"
-TITLE  = "#f2b6c6"
+TITLE  = "#f2b6c6"   # 桜ピンク
 GRID_A = 0.25
-
-# Line colors (Up / Down)
-GREEN = "#22c55e"   # 上昇
-RED   = "#ef4444"   # 下落
-NEUTRAL = "#94a3b8" # 同値 or データ不足
+UP_COLOR   = "#22c55e"  # 緑
+DOWN_COLOR = "#ef4444"  # 赤
 
 matplotlib.rcParams.update({
     "figure.facecolor": BG,
@@ -54,8 +53,7 @@ matplotlib.rcParams.update({
 
 OUTPUTS_DIR = os.path.join("docs", "outputs")
 
-
-# === Utilities ===
+# --- Utils -------------------------------------------------------------------
 def _lower(df: pd.DataFrame) -> pd.DataFrame:
     df.columns = [str(c).strip().lower() for c in df.columns]
     return df
@@ -72,19 +70,17 @@ def _pick_time_col(cols: List[str]) -> Optional[str]:
             return c
     return None
 
-def _auto_color(series: pd.Series) -> str:
-    """Return GREEN if last>=first, RED if last<first, else NEUTRAL."""
-    s = pd.to_numeric(series, errors="coerce").dropna()
-    if len(s) < 2:
-        return NEUTRAL
-    first, last = s.iloc[0], s.iloc[-1]
-    if pd.isna(first) or pd.isna(last):
-        return NEUTRAL
-    return GREEN if last >= first else RED
+def _auto_color(values: pd.Series) -> str:
+    try:
+        first = pd.to_numeric(values.iloc[0])
+        last  = pd.to_numeric(values.iloc[-1])
+        return UP_COLOR if (last - first) >= 0 else DOWN_COLOR
+    except Exception:
+        return FG
 
 def read_any_intraday(path: str) -> pd.DataFrame:
     """
-    Return columns: time (tz-aware JST), value, volume
+    Return columns: time(value tz-aware JST), value, volume
     Accepts either long ("time,value[,volume]") or wide (tickers) formats.
     """
     if not os.path.exists(path):
@@ -103,7 +99,7 @@ def read_any_intraday(path: str) -> pd.DataFrame:
     if tcol is None:
         raise KeyError(f"No time-like column in {path}")
 
-    # guess value / volume
+    # value / volume 列推定（long 形式）
     vcol, volcol = None, None
     for c in df.columns:
         lc = c
@@ -112,21 +108,17 @@ def read_any_intraday(path: str) -> pd.DataFrame:
         if lc == "volume" or ("volume" in lc):
             volcol = c
 
-    # time to tz-aware JST
+    # time -> tz-aware JST
     t = pd.to_datetime(df[tcol], errors="coerce", utc=True)
-    if t.dt.tz is None:  # naive -> JST
-        t = pd.to_datetime(df[tcol], errors="coerce").dt.tz_localize(JP_TZ)
-    else:
-        t = t.dt.tz_convert(JP_TZ)
+    if t.dt.tz is None:  # naive → JST ローカライズ
+        t = pd.to_datetime(df[tcol], errors="coerce").dt.tz_localize(JP_TZ).dt.tz_convert("UTC")
+    t = t.dt.tz_convert(JP_TZ)
 
     out = pd.DataFrame({"time": t})
 
     if vcol is not None:
         out["value"] = pd.to_numeric(df[vcol], errors="coerce")
-        out["volume"] = (
-            pd.to_numeric(df[volcol], errors="coerce")
-            if (volcol and volcol in df.columns) else 0
-        )
+        out["volume"] = pd.to_numeric(df[volcol], errors="coerce") if (volcol and volcol in df.columns) else 0
     else:
         # wide → 等加重平均
         num_cols = []
@@ -145,7 +137,8 @@ def read_any_intraday(path: str) -> pd.DataFrame:
     return out.dropna(subset=["time", "value"]).sort_values("time").reset_index(drop=True)
 
 def clamp_today_session_jst(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty:
+    """取引時間で当日データを切り出す。無効化 or 時刻未指定ならそのまま返す。"""
+    if df.empty or not CLAMP_SESSION or not SESSION_START or not SESSION_END:
         return df
     today = pd.Timestamp.now(tz=JP_TZ).normalize()
     start = pd.Timestamp(f"{today.date()} {SESSION_START}", tz=JP_TZ)
@@ -185,20 +178,19 @@ def _save(fig, path: str):
     fig.savefig(path, facecolor=BG, bbox_inches="tight")
     plt.close(fig)
 
-
-# === Main ===
+# --- Main --------------------------------------------------------------------
 def main():
-    index_key = os.environ.get("INDEX_KEY", "rbank9").strip().lower()
+    index_key = os.environ.get("INDEX_KEY", "ain10").strip().lower()
     index_name = index_key.upper().replace("_", "")
     os.makedirs(OUTPUTS_DIR, exist_ok=True)
 
     intraday_csv = os.path.join(OUTPUTS_DIR, f"{index_key}_intraday.csv")
     history_csv  = os.path.join(OUTPUTS_DIR, f"{index_key}_history.csv")
 
-    # ---- 1d (intraday) ----
+    # 1d
     try:
         i = read_any_intraday(intraday_csv)
-        i = clamp_today_session_jst(i)
+        i = clamp_today_session_jst(i)          # AIN-10 では既定で無効（環境変数で有効化可）
         i = resample_minutes(i, "1min")
     except Exception as e:
         print(f"[WARN] intraday load failed: {e}")
@@ -213,7 +205,7 @@ def main():
         ax.text(0.5, 0.5, "No data", transform=ax.transAxes, ha="center", va="center", alpha=0.6)
     _save(fig, os.path.join(OUTPUTS_DIR, f"{index_key}_1d.png"))
 
-    # ---- 7d / 1m / 1y (daily history) ----
+    # 7d / 1m / 1y
     h = read_history(history_csv)
 
     def plot_hist(tail_n: int, label: str, out: str):
@@ -224,7 +216,7 @@ def main():
             color = _auto_color(hh["value"])
             ax.plot(hh["date"], hh["value"], linewidth=2.2, color=color)
         elif len(hh) == 1:
-            ax.plot(hh["date"], hh["value"], marker="o", markersize=6, linewidth=0, color=NEUTRAL)
+            ax.plot(hh["date"], hh["value"], marker="o", markersize=6, linewidth=0, color=FG)
             y = hh["value"].iloc[0]
             ax.set_ylim(y - 0.1, y + 0.1)
             ax.text(0.5, 0.5, "Only 1 point (need ≥ 2)", transform=ax.transAxes,
@@ -238,7 +230,7 @@ def main():
     plot_hist(30,  "1m", f"{index_key}_1m.png")
     plot_hist(365, "1y", f"{index_key}_1y.png")
 
-    # 最終実行ログ
+    # メモ（任意）
     with open(os.path.join(OUTPUTS_DIR, "_last_run.txt"), "w") as f:
         f.write(pd.Timestamp.now(tz=JP_TZ).isoformat())
 
