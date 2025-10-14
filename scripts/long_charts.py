@@ -2,191 +2,165 @@
 # -*- coding: utf-8 -*-
 
 """
-桜Index: 長期チャート生成 & 日中騰落率の正規化出力（全指数共通版）
-- intraday/history を読み、PNG(1d/7d/1m/1y, intraday) を生成
-- 値スケール自動判定（price / pct / fraction）で 1d 変化率を % で算出
-- {KEY}_stats.json と {KEY}_post_intraday.txt を出力（サイト表示は stats.json を使用）
+桜Index: intraday変化率を算出（PNGは触らない）
+- intraday.csv を元に {key}_stats.json / {key}_post_intraday.txt を更新
+- ％系列(pct)は前半/後半の中央値差でロバストに算出（外れ値・ゼロ始値対策）
 """
 
-import os
-import json
-from datetime import datetime, timedelta, time as dtime
+import os, json
+from datetime import datetime, time as dtime
 from pathlib import Path
-from typing import Tuple, List, Optional
-
+from typing import List, Tuple
+import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
 
-
-# ========== 環境 ==========
 OUTDIR = Path("docs/outputs")
 OUTDIR.mkdir(parents=True, exist_ok=True)
 
-INDEX_KEY = os.environ.get("INDEX_KEY", "index")          # 例: "rbank9" / "ain10" / "scoin_plus" / "astra4"
-MARKET_TZ = os.environ.get("MARKET_TZ", "Asia/Tokyo")      # 例: "Asia/Tokyo", "America/New_York", "UTC"
-SESSION_START = os.environ.get("SESSION_START", "09:00")   # "HH:MM"
-SESSION_END   = os.environ.get("SESSION_END",   "15:30")   # "HH:MM"
-CLAMP_SESSION = os.environ.get("CLAMP_SESSION", "true").lower() == "true"
+INDEX_KEY = os.environ.get("INDEX_KEY", "index").lower()
+MARKET_TZ = os.environ.get("MARKET_TZ", "Asia/Tokyo")
+SESSION_START = os.environ.get("SESSION_START", "09:00")
+SESSION_END   = os.environ.get("SESSION_END",   "15:30")
 
-PNG_LINEWIDTH = 1.5
+# 指数ごとのスケール固定
+SCALE_MAP = {
+    "scoin_plus": "price",     # 水準
+    "rbank9": "pct",           # ％ポイント系列
+    "ain10": "pct",            # ％ポイント系列
+    "astra4": "fraction",      # 小数リターン系列（0.012 = 1.2%）
+}
 
-
-# ========== ユーティリティ ==========
-def _pick_value_column(df: pd.DataFrame) -> str:
-    """最右列（time/timestamp/datetime/日時 以外）を値列とみなす"""
-    candidates = [c for c in df.columns if c.lower() not in ("time", "timestamp", "datetime", "日時")]
-    if not candidates:
-        raise ValueError("値列が見つかりませんでした")
-    return candidates[-1]
-
-
-def _read_csv_generic(path: Path) -> Optional[pd.DataFrame]:
+# ======== 読み込みユーティリティ ========
+def _read_csv(path: Path) -> pd.DataFrame:
     if not path.exists():
-        return None
+        raise FileNotFoundError(f"{path} not found")
     df = pd.read_csv(path)
-    # 時刻列の正規化
-    time_cols = [c for c in df.columns if c.lower() in ("time", "timestamp", "datetime", "日時")]
-    if not time_cols:
-        raise ValueError(f"{path} に time/timestamp/datetime/日時 の列がありません")
-    tcol = time_cols[0]
+    tcols = [c for c in df.columns if c.lower() in ("datetime", "timestamp", "time", "日時", "date")]
+    if not tcols:
+        raise ValueError(f"{path} に日時列がありません")
+    tcol = tcols[0]
+    vcol = [c for c in df.columns if c.lower() not in ("datetime", "timestamp", "time", "日時", "date")][-1]
+
     df["ts_utc"] = pd.to_datetime(df[tcol], utc=True, errors="coerce")
-    df = df.dropna(subset=["ts_utc"]).sort_values("ts_utc").reset_index(drop=True)
-    # 値列の抽出
-    vcol = _pick_value_column(df)
-    df["value"] = pd.to_numeric(df[vcol], errors="coerce")
-    df = df.dropna(subset=["value"])
+    df["value"]  = pd.to_numeric(df[vcol], errors="coerce")
+    df = df.dropna(subset=["ts_utc", "value"]).sort_values("ts_utc").reset_index(drop=True)
     return df[["ts_utc", "value"]]
-
-
-def _detect_value_scale(values: List[float]) -> str:
-    """値のスケールを自動判定: 'price' / 'pct' / 'fraction'"""
-    vals = [v for v in values if v is not None]
-    if len(vals) < 2:
-        return "unknown"
-    s, e = vals[0], vals[-1]
-    max_abs = max(abs(s), abs(e))
-    if max_abs > 20:
-        return "price"      # 例: 100, 101
-    elif max_abs < 1:
-        return "fraction"   # 例: 0.004, -0.012 （= 0.4%, -1.2%）
-    else:
-        return "pct"        # 例: -1.2, +0.5 （= 既に%単位）
-
-
-def _compute_change_percent(values: List[float]) -> Tuple[float, str]:
-    """スケール自動判定のうえ、常に '%' で変化率を返す"""
-    vals = [v for v in values if v is not None]
-    if len(vals) < 2:
-        return 0.0, "unknown"
-    s, e = vals[0], vals[-1]
-    scale = _detect_value_scale(vals)
-    if scale == "price":
-        chg = (e / s - 1.0) * 100.0 if s != 0 else 0.0
-    elif scale == "pct":
-        chg = (e - s)  # 既に% → 差分（パーセントポイント）
-    elif scale == "fraction":
-        chg = (e - s) * 100.0  # 小数 → % へ
-    else:
-        chg = 0.0
-    return round(chg, 6), scale
-
 
 def _to_market_tz(ts_utc: pd.Series) -> pd.Series:
     return ts_utc.dt.tz_convert(MARKET_TZ)
 
-
-def _session_bounds_for(ts_local: pd.Series) -> Tuple[datetime, datetime]:
-    """最新営業日のセッション開始・終了のローカル時刻（マーケットTZ）を返す"""
+def _session_bounds(ts_local: pd.Series) -> Tuple[pd.Timestamp, pd.Timestamp]:
     if ts_local.empty:
-        now_local = pd.Timestamp.utcnow().tz_localize("UTC").tz_convert(MARKET_TZ)
+        now_local = pd.Timestamp.utcnow()
+        if now_local.tzinfo is None:
+            now_local = now_local.tz_localize("UTC").tz_convert(MARKET_TZ)
+        else:
+            now_local = now_local.tz_convert(MARKET_TZ)
         base_date = now_local.date()
     else:
         base_date = ts_local.iloc[-1].date()
 
     s_h, s_m = map(int, SESSION_START.split(":"))
     e_h, e_m = map(int, SESSION_END.split(":"))
-    start = pd.Timestamp(datetime.combine(base_date, dtime(hour=s_h, minute=s_m)), tz=MARKET_TZ)
-    end   = pd.Timestamp(datetime.combine(base_date, dtime(hour=e_h, minute=e_m)), tz=MARKET_TZ)
+    start = pd.Timestamp(datetime.combine(base_date, dtime(s_h, s_m))).tz_localize(MARKET_TZ)
+    end   = pd.Timestamp(datetime.combine(base_date, dtime(e_h, e_m))).tz_localize(MARKET_TZ)
     if end <= start:
         end += pd.Timedelta(days=1)
-    return (start.to_pydatetime(), end.to_pydatetime())
+    return start, end
 
-
-def _clamp_session(df: pd.DataFrame) -> pd.DataFrame:
-    """マーケットTZの当日セッション時間帯で絞り込む（CLAMP_SESSION=true の時）"""
-    if df.empty or not CLAMP_SESSION:
+def _clamp_today(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
         return df
     ts_local = _to_market_tz(df["ts_utc"])
-    start, end = _session_bounds_for(ts_local)
+    start, end = _session_bounds(ts_local)
     mask = (ts_local >= start) & (ts_local <= end)
     out = df.loc[mask].copy()
     if out.empty:
-        # もし当日セッションにデータがなければ直近日の全データを返す
         last_day = ts_local.dt.date.iloc[-1]
         out = df.loc[ts_local.dt.date == last_day].copy()
     return out
 
+# ======== 変化率の計算 ========
+def _robust_open_close_pct(values: np.ndarray) -> Tuple[float, float]:
+    """
+    ％系列専用：前半/後半ブロックの中央値を open/close とみなす。
+    - ゼロや極小値で平均が潰れる問題を避ける
+    - 前半: 先頭から上位 max(5, n*0.1) 件
+      後半: 末尾から上位 max(5, n*0.1) 件
+    - 各ブロックは外れ値を除去（IQRの1.5倍ルール）
+    """
+    n = len(values)
+    if n < 2:
+        return np.nan, np.nan
 
-def _plot_series(df: pd.DataFrame, title: str, outpath: Path):
-    if df.empty:
-        return
-    ts_local = _to_market_tz(df["ts_utc"])
-    plt.figure(figsize=(6.5, 3.2), dpi=160)
-    plt.plot(ts_local, df["value"], linewidth=PNG_LINEWIDTH)
-    plt.title(title)
-    plt.xlabel("Time")
-    plt.ylabel("Index / Value")
-    plt.tight_layout()
-    outpath.parent.mkdir(parents=True, exist_ok=True)
-    plt.savefig(outpath)
-    plt.close()
+    k = max(5, int(n * 0.1))
+    head = values[:k]
+    tail = values[-k:]
 
+    def _rm_outliers(x: np.ndarray) -> np.ndarray:
+        x = x[np.isfinite(x)]
+        if len(x) == 0:
+            return x
+        q1, q3 = np.percentile(x, [25, 75])
+        iqr = q3 - q1
+        lo, hi = q1 - 1.5 * iqr, q3 + 1.5 * iqr
+        return x[(x >= lo) & (x <= hi)]
 
-def _window_from_history(df_hist: pd.DataFrame, days: int) -> pd.DataFrame:
-    if df_hist is None or df_hist.empty:
-        return pd.DataFrame(columns=["ts_utc", "value"])
-    cutoff = pd.Timestamp.utcnow().tz_localize("UTC") - pd.Timedelta(days=days)
-    return df_hist.loc[df_hist["ts_utc"] >= cutoff].copy()
+    head = _rm_outliers(head)
+    tail = _rm_outliers(tail)
 
+    if len(head) == 0 or len(tail) == 0:
+        return np.nan, np.nan
 
-# ========== メイン処理 ==========
+    open_med  = float(np.median(head))
+    close_med = float(np.median(tail))
+    return open_med, close_med
+
+def _compute_change(values: List[float], scale: str) -> float:
+    arr = np.array(values, dtype=float)
+    arr = arr[np.isfinite(arr)]
+    if len(arr) < 2:
+        return 0.0
+
+    if scale == "pct":
+        o, c = _robust_open_close_pct(arr)
+        if np.isnan(o) or np.isnan(c):
+            # フォールバック：単純な差分
+            pct = arr[-1] - arr[0]
+        else:
+            pct = c - o
+        # ガードレール：日中で±30ppを超えるのは異常値とみなしクリップ
+        pct = float(np.clip(pct, -30.0, 30.0))
+        return round(pct, 6)
+
+    # price/fraction は従来どおり
+    start, end = arr[0], arr[-1]
+
+    # 極小始値→倍率暴発防止（price/fraction 共通）
+    if abs(start) < 1e-6:
+        start = float(np.median(arr[:max(5, len(arr)//10)]))
+
+    if scale == "price":
+        pct = (end / start - 1.0) * 100.0
+    else:  # fraction
+        pct = (end - start) * 100.0
+    # price/fraction も常識的な範囲に丸める（±50%）
+    pct = float(np.clip(pct, -50.0, 50.0))
+    return round(pct, 6)
+
+# ======== メイン ========
 def main():
-    # 1) 入力ファイル検出
-    intraday_csv = OUTDIR / f"{INDEX_KEY}_intraday.csv"
-    history_csv  = OUTDIR / f"{INDEX_KEY}_history.csv"
+    df = _read_csv(OUTDIR / f"{INDEX_KEY}_intraday.csv")
+    df = _clamp_today(df)
 
-    df_intraday = _read_csv_generic(intraday_csv) if intraday_csv.exists() else pd.DataFrame(columns=["ts_utc", "value"])
-    df_history  = _read_csv_generic(history_csv)  if history_csv.exists()  else pd.DataFrame(columns=["ts_utc", "value"])
+    scale = SCALE_MAP.get(INDEX_KEY, "pct")
+    pct_1d = _compute_change(df["value"].tolist(), scale)
 
-    # 2) セッション内 1D ウィンドウ（intraday）
-    df_1d_raw = df_intraday.copy()
-    df_1d = _clamp_session(df_1d_raw)
-
-    # 3) 7d/1m/1y ウィンドウ（history ベース / fallback intraday）
-    df_7d = _window_from_history(df_history if not df_history.empty else df_intraday, 7)
-    df_1m = _window_from_history(df_history if not df_history.empty else df_intraday, 31)
-    df_1y = _window_from_history(df_history if not df_history.empty else df_intraday, 366)
-
-    # 4) 画像生成
-    _plot_series(df_1d, f"{INDEX_KEY.upper()} (1d)", OUTDIR / f"{INDEX_KEY}_1d.png")
-    _plot_series(df_7d, f"{INDEX_KEY.upper()} (7d)", OUTDIR / f"{INDEX_KEY}_7d.png")
-    _plot_series(df_1m, f"{INDEX_KEY.upper()} (1m)", OUTDIR / f"{INDEX_KEY}_1m.png")
-    _plot_series(df_1y, f"{INDEX_KEY.upper()} (1y)", OUTDIR / f"{INDEX_KEY}_1y.png")
-    _plot_series(df_intraday, f"{INDEX_KEY.upper()} (intraday)", OUTDIR / f"{INDEX_KEY}_intraday.png")
-
-    # 5) 1d 変化率（％）を自動判定で算出
-    pct_1d = 0.0
-    scale_used = "unknown"
-    if not df_1d.empty:
-        vals = df_1d["value"].tolist()
-        pct_1d, scale_used = _compute_change_percent(vals)
-
-    # 6) stats.json / post_intraday.txt を出力
     stats = {
-        "pct_1d": pct_1d,
-        "scale": scale_used,                 # 監査用
-        "updated_at": datetime.utcnow().isoformat() + "Z",
         "index_key": INDEX_KEY,
+        "pct_1d": pct_1d,
+        "scale": scale,
+        "updated_at": datetime.utcnow().isoformat() + "Z",
     }
     (OUTDIR / f"{INDEX_KEY}_stats.json").write_text(json.dumps(stats, ensure_ascii=False), encoding="utf-8")
 
@@ -196,10 +170,7 @@ def main():
         encoding="utf-8"
     )
 
-    # 7) ログ
-    print(f"[{INDEX_KEY}] 1d change: {pct_1d:.3f}% (scale={scale_used})")
-    print(f"[{INDEX_KEY}] outputs -> {OUTDIR}")
-
+    print(f"[{INDEX_KEY}] pct_1d={pct_1d:.3f} (scale={scale})")
 
 if __name__ == "__main__":
     main()
