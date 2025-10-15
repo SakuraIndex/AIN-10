@@ -18,7 +18,7 @@ DARK_BG = "#0e0f13"
 DARK_AX = "#0b0c10"
 FG_TEXT = "#e7ecf1"
 GRID = "#2a2e3a"
-GREEN = "#00c2a8"   # 既存の色味を踏襲してもOK。赤に統一したいなら RED を使う
+LINE_COLOR = "#00c2a8"   # 既存色を踏襲（赤に統一したければ #ff6b6b）
 
 def _apply(ax, title):
     fig = ax.figure
@@ -32,11 +32,10 @@ def _apply(ax, title):
     ax.set_xlabel("Time", color=FG_TEXT, fontsize=10)
     ax.set_ylabel("Index / Value", color=FG_TEXT, fontsize=10)
 
-def _save(df, col, out_png, title, color=GREEN):
-    import matplotlib.pyplot as plt
+def _save(df, col, out_png, title):
     fig, ax = plt.subplots()
     _apply(ax, title)
-    ax.plot(df.index, df[col], color=color, linewidth=1.6)
+    ax.plot(df.index, df[col], color=LINE_COLOR, linewidth=1.6)
     fig.savefig(out_png, bbox_inches="tight", facecolor=fig.get_facecolor())
     plt.close(fig)
 
@@ -58,13 +57,11 @@ def gen_pngs():
 
 def write_stats():
     """
-    AIN-10 は intraday 値が %（0.00, 0.41, -0.15 ...）
-    → 1日騰落率[%] = last_value
+    AIN-10 は intraday が %単位。
+    → 騰落率[%] = last_value
     """
     df = _load_df(); col = df.columns[-1]
-    pct = None
-    if len(df):
-        pct = float(df[col].iloc[-1])
+    pct = float(df[col].iloc[-1]) if len(df) else None
 
     payload = {
         "index_key": INDEX_KEY,
@@ -73,8 +70,11 @@ def write_stats():
         "updated_at": pd.Timestamp.utcnow().isoformat(timespec="seconds") + "Z",
     }
     (OUTDIR / f"{INDEX_KEY}_stats.json").write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
     if pct is not None:
-        (OUTDIR / f"{INDEX_KEY}_post_intraday.txt").write_text(f"{INDEX_KEY.upper()} 1d: {pct:+.2f}%\n", encoding="utf-8")
+        (OUTDIR / f"{INDEX_KEY}_post_intraday.txt").write_text(
+            f"{INDEX_KEY.upper()} 1d: {pct:+.2f}%\n", encoding="utf-8"
+        )
 
 if __name__ == "__main__":
     gen_pngs()
