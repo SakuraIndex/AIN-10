@@ -89,7 +89,7 @@ jobs:
           PY
 
       # ──────────────────────────
-      # 営業時間中：5分おきに intraday スナップショットを更新
+      # 営業時間中：5分おきに intraday を更新
       # ──────────────────────────
       - name: Intraday snapshot (every 5 min during session)
         if: steps.flags.outputs.in_session == 'true'
@@ -107,11 +107,55 @@ jobs:
             [ "$f" = "$new" ] || mv -f "$f" "$new"
           done
 
-          # 変更があればコミット
+      - name: Update stats.json from intraday (lightweight)
+        if: steps.flags.outputs.in_session == 'true'
+        shell: bash
+        env:
+          INDEX_KEY: "ain10"
+          OUTDIR: "docs/outputs"
+        run: |
+          set -euo pipefail
+          python - << 'PY'
+          from pathlib import Path
+          import pandas as pd, json
+          from datetime import datetime, timezone
+
+          INDEX_KEY = "ain10"
+          OUTDIR = Path("docs/outputs")
+          intraday = OUTDIR / f"{INDEX_KEY}_intraday.csv"
+          if not intraday.exists():
+              raise SystemExit(0)
+
+          df = pd.read_csv(intraday, parse_dates=[0], index_col=0)
+          df = df.dropna(how="all")
+          if df.empty:
+              raise SystemExit(0)
+
+          col = df.columns[-1]
+          # AIN-10 は intraday が %値を直接保持する仕様（例: 0.95 は +0.95%）
+          last = float(df[col].iloc[-1])
+
+          payload = {
+              "index_key": INDEX_KEY,
+              "pct_1d": round(last, 6),
+              "scale": "pct",
+              "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+          }
+          (OUTDIR / f"{INDEX_KEY}_stats.json").write_text(
+              json.dumps(payload, ensure_ascii=False), encoding="utf-8"
+          )
+          PY
+
+      - name: Commit intraday & stats (during session)
+        if: steps.flags.outputs.in_session == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add "$OUTDIR"/*intraday* "$OUTDIR"/*_post_intraday.txt 2>/dev/null || true
-          git commit -m "chore(intraday): ain10 snapshot update" || echo "no intraday changes"
+          # ★ intraday成果物 + marker + stats.json をまとめてコミット
+          git add "$OUTDIR"/*intraday* "$OUTDIR"/*_post_intraday.txt "$OUTDIR"/*_stats.json 2>/dev/null || true
+          git commit -m "chore(intraday): ain10 snapshot & stats update" || echo "no intraday changes"
           git push || true
 
       # ──────────────────────────
@@ -131,7 +175,7 @@ jobs:
             python scripts/update_history.py || true
           fi
 
-          # 長期チャート＆統計
+          # 長期チャート＆統計（PNG/CSV/JSON）
           python "$CLOSE_SCRIPT"
 
           # 命名揺れの正規化（旧: ain_10_ → 新: ain10_）
@@ -145,7 +189,7 @@ jobs:
           # 二重実行防止フラグ
           echo "$CLOSE_KEY" > "$OUTDIR/_last_run.txt"
 
-          # 変更があればコミット
+          # 変更があればコミット（PNG/CSV/JSON すべて対象）
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add "$OUTDIR"/* 2>/dev/null || true
