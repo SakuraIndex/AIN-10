@@ -8,18 +8,26 @@ on:
 permissions:
   contents: write
 
+# 同時実行の衝突を避ける（任意だが推奨）
+concurrency:
+  group: long-charts-${{ github.ref }}
+  cancel-in-progress: false
+
 env:
-  # ★★ ここをリポに合わせて変更 ★★
+  # ★★ このリポに合わせて変更 ★★
   INDEX_KEY: ain10   # AIN-10: ain10 / Astra4: astra4 / S-COIN+: scoin_plus / R-BANK9: rbank9
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 12
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          persist-credentials: true
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -53,22 +61,30 @@ jobs:
 
       - name: Commit charts if changed
         run: |
+          set -e
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          # ★ 4枚＋CSVを確実にステージング（INDEX_KEYごとに）
-          git add docs/outputs/${{ env.INDEX_KEY }}_1d.png    || true
-          git add docs/outputs/${{ env.INDEX_KEY }}_7d.png    || true
-          git add docs/outputs/${{ env.INDEX_KEY }}_1m.png    || true
-          git add docs/outputs/${{ env.INDEX_KEY }}_1y.png    || true
-          git add docs/outputs/${{ env.INDEX_KEY }}_1d.csv    || true
-          git add docs/outputs/${{ env.INDEX_KEY }}_7d.csv    || true
-          git add docs/outputs/${{ env.INDEX_KEY }}_1m.csv    || true
-          git add docs/outputs/${{ env.INDEX_KEY }}_1y.csv    || true
+
+          # 画像（1d/7d/1m/1y）
+          git add docs/outputs/${{ env.INDEX_KEY }}_1d.png || true
+          git add docs/outputs/${{ env.INDEX_KEY }}_7d.png || true
+          git add docs/outputs/${{ env.INDEX_KEY }}_1m.png || true
+          git add docs/outputs/${{ env.INDEX_KEY }}_1y.png || true
+
+          # 任意: CSV（生成していなければ no-op）
+          git add docs/outputs/${{ env.INDEX_KEY }}_1d.csv || true
+          git add docs/outputs/${{ env.INDEX_KEY }}_7d.csv || true
+          git add docs/outputs/${{ env.INDEX_KEY }}_1m.csv || true
+          git add docs/outputs/${{ env.INDEX_KEY }}_1y.csv || true
+
+          # ★ サイトが使う stats/marker も必ずコミット
+          git add docs/outputs/${{ env.INDEX_KEY }}_stats.json        || true
+          git add docs/outputs/${{ env.INDEX_KEY }}_post_intraday.txt || true
 
           if git diff --cached --quiet; then
             echo "No chart updates."
             exit 0
           fi
 
-          git commit -m "chore(charts): update ${{ env.INDEX_KEY }} 1d/7d/1m/1y"
+          git commit -m "chore(charts): update ${{ env.INDEX_KEY }} (1d/7d/1m/1y + stats)"
           git push
