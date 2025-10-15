@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-AIN-10 charts + stats (pct scale, dark theme, auto color)
-背景統一版（他指数と完全一致）
+AIN-10 charts + stats  (pct scale, unified dark theme)
 """
 from pathlib import Path
 import json
@@ -10,6 +9,9 @@ from datetime import datetime, timezone
 import pandas as pd
 import matplotlib.pyplot as plt
 
+# ------------------------
+# constants / paths
+# ------------------------
 INDEX_KEY = "ain10"
 OUTDIR = Path("docs/outputs")
 OUTDIR.mkdir(parents=True, exist_ok=True)
@@ -18,21 +20,37 @@ HISTORY_CSV  = OUTDIR / f"{INDEX_KEY}_history.csv"
 INTRADAY_CSV = OUTDIR / f"{INDEX_KEY}_intraday.csv"
 
 # ------------------------
-# unified dark theme colors
+# unified dark theme (strict)
 # ------------------------
-DARK_BG = "#0e0f13"   # 背景
-DARK_AX = "#0b0c10"   # 軸エリア
-FG_TEXT = "#e7ecf1"   # 文字
-GRID    = "#2a2e3a"
+DARK_BG  = "#0e0f13"   # figure 背景
+DARK_AX  = "#0b0c10"   # 軸エリア背景
+FG_TEXT  = "#e7ecf1"
+GRID     = "#2a2e3a"
+LINE_COL = "#00c2a8"   # AIN-10 既存のライン色
+
+# ここで matplotlib の既定を強制固定（ズレ防止）
+plt.rcParams.update({
+    "figure.facecolor": DARK_BG,
+    "axes.facecolor": DARK_AX,
+    "savefig.facecolor": DARK_BG,
+    "savefig.edgecolor": DARK_BG,
+    "savefig.transparent": False,  # 透明PNGを禁止
+})
 
 def _apply(ax, title: str) -> None:
     fig = ax.figure
     fig.set_size_inches(12, 7)
     fig.set_dpi(160)
+
+    # 念のため個別にも徹底的に指定
     fig.patch.set_facecolor(DARK_BG)
+    fig.patch.set_alpha(1.0)
     ax.set_facecolor(DARK_AX)
+    ax.patch.set_alpha(1.0)
+
     for sp in ax.spines.values():
         sp.set_color(GRID)
+
     ax.grid(color=GRID, alpha=0.6, linewidth=0.8)
     ax.tick_params(colors=FG_TEXT, labelsize=10)
     ax.yaxis.get_major_formatter().set_scientific(False)
@@ -43,32 +61,20 @@ def _apply(ax, title: str) -> None:
 def _save(df: pd.DataFrame, col: str, out_png: Path, title: str) -> None:
     fig, ax = plt.subplots()
     _apply(ax, title)
-
-    # --- ここで既存の色ロジックを保持 ---
-    # 値の増減に応じて色を動的に決定（陽線→緑 / 陰線→赤）
-    first, last = df[col].iloc[0], df[col].iloc[-1]
-    color = "#00c873" if last >= first else "#ff6b6b"
-
-    ax.plot(df.index, df[col], color=color, linewidth=1.6)
-
-    # 背景を確実に統一
+    ax.plot(df.index, df[col], color=LINE_COL, linewidth=1.6)
+    # 透明禁止 & 背景色を明示（念押し）
     fig.savefig(
         out_png,
         bbox_inches="tight",
-        facecolor=fig.get_facecolor(),
-        edgecolor="none",
+        facecolor=DARK_BG,
+        edgecolor=DARK_BG,
+        transparent=False,
     )
     plt.close(fig)
 
-def _pick_index_column(df: pd.DataFrame) -> str:
-    def norm(s: str) -> str:
-        return s.strip().lower().replace("-", "").replace("_", "")
-    targets = {INDEX_KEY, "ain10index"}
-    for c in df.columns:
-        if norm(c) in targets:
-            return c
-    return df.columns[-1]
-
+# ------------------------
+# data loading helpers
+# ------------------------
 def _load_df() -> pd.DataFrame:
     if INTRADAY_CSV.exists():
         df = pd.read_csv(INTRADAY_CSV, parse_dates=[0], index_col=0)
@@ -76,25 +82,41 @@ def _load_df() -> pd.DataFrame:
         df = pd.read_csv(HISTORY_CSV, parse_dates=[0], index_col=0)
     else:
         raise FileNotFoundError("AIN-10: neither intraday nor history csv found.")
+    df = df.dropna(how="all")
     for c in list(df.columns):
         df[c] = pd.to_numeric(df[c], errors="coerce")
-    return df.dropna(how="all")
+    df = df.dropna(how="all")
+    return df
 
+# ------------------------
+# chart generation
+# ------------------------
 def gen_pngs() -> None:
     df = _load_df()
-    col = _pick_index_column(df)
-    _save(df.tail(1000), col, OUTDIR / f"{INDEX_KEY}_1d.png", f"{INDEX_KEY.upper()} (1d)")
+    col = df.columns[-1]
+    _save(df.tail(1000),  col, OUTDIR / f"{INDEX_KEY}_1d.png", f"{INDEX_KEY.upper()} (1d)")
     _save(df.tail(7*1000), col, OUTDIR / f"{INDEX_KEY}_7d.png", f"{INDEX_KEY.upper()} (7d)")
-    _save(df, col, OUTDIR / f"{INDEX_KEY}_1m.png", f"{INDEX_KEY.upper()} (1m)")
-    _save(df, col, OUTDIR / f"{INDEX_KEY}_1y.png", f"{INDEX_KEY.upper()} (1y)")
+    _save(df,             col, OUTDIR / f"{INDEX_KEY}_1m.png", f"{INDEX_KEY.upper()} (1m)")
+    _save(df,             col, OUTDIR / f"{INDEX_KEY}_1y.png", f"{INDEX_KEY.upper()} (1y)")
 
+# ------------------------
+# stats (pct)
+# ------------------------
 def _now_utc_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 def write_stats_and_marker() -> None:
+    """
+    AIN-10 は intraday が %（百分率）を直接保持（例: 0.95 は +0.95%）
+    """
     df = _load_df()
-    col = _pick_index_column(df)
-    pct = float(df[col].iloc[-1]) if len(df.index)>0 and pd.notna(df[col].iloc[-1]) else None
+    col = df.columns[-1]
+
+    pct = None
+    if len(df.index) > 0:
+        last = df[col].iloc[-1]
+        if pd.notna(last):
+            pct = float(last)
 
     payload = {
         "index_key": INDEX_KEY,
@@ -107,11 +129,14 @@ def write_stats_and_marker() -> None:
     )
 
     marker = OUTDIR / f"{INDEX_KEY}_post_intraday.txt"
-    marker.write_text(
-        f"{INDEX_KEY.upper()} 1d: {'N/A' if pct is None else f'{pct:+.2f}%'}\n",
-        encoding="utf-8",
-    )
+    if pct is None:
+        marker.write_text(f"{INDEX_KEY.upper()} 1d: N/A\n", encoding="utf-8")
+    else:
+        marker.write_text(f"{INDEX_KEY.upper()} 1d: {pct:+.2f}%\n", encoding="utf-8")
 
+# ------------------------
+# main
+# ------------------------
 if __name__ == "__main__":
     gen_pngs()
     write_stats_and_marker()
