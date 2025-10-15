@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-AIN-10 charts + stats  (pct scale, dark theme)
+AIN-10 charts + stats (pct scale, dark theme)
 """
 from pathlib import Path
 import json
@@ -20,13 +20,13 @@ HISTORY_CSV  = OUTDIR / f"{INDEX_KEY}_history.csv"
 INTRADAY_CSV = OUTDIR / f"{INDEX_KEY}_intraday.csv"
 
 # ------------------------
-# plotting style (dark)
+# unified dark theme
 # ------------------------
-DARK_BG = "#0e0f13"
-DARK_AX = "#0b0c10"
-FG_TEXT = "#e7ecf1"
+DARK_BG = "#0e0f13"   # 背景
+DARK_AX = "#0b0c10"   # 軸エリア
+FG_TEXT = "#e7ecf1"   # 文字
 GRID    = "#2a2e3a"
-LINE_COLOR = "#00c2a8"   # 既存配色（ティール）
+RED     = "#ff6b6b"
 
 def _apply(ax, title: str) -> None:
     fig = ax.figure
@@ -46,46 +46,33 @@ def _apply(ax, title: str) -> None:
 def _save(df: pd.DataFrame, col: str, out_png: Path, title: str) -> None:
     fig, ax = plt.subplots()
     _apply(ax, title)
-    ax.plot(df.index, df[col], color=LINE_COLOR, linewidth=1.6)
+    ax.plot(df.index, df[col], color=RED, linewidth=1.6)
     fig.savefig(out_png, bbox_inches="tight", facecolor=fig.get_facecolor())
     plt.close(fig)
 
 # ------------------------
-# data loading helpers
+# data loading
 # ------------------------
 def _pick_index_column(df: pd.DataFrame) -> str:
-    """
-    AIN-10 の列名ゆれを吸収して本列を決定。
-    無ければ最後の列を使う。
-    """
     def norm(s: str) -> str:
-        return s.strip().lower().replace("_", "").replace("-", "")
-    targets = {
-        "ain10", "ain10index", norm(INDEX_KEY), norm(INDEX_KEY.upper()),
-        "aiindex10", "ai10"  # 念のため
-    }
-    ncols = {c: norm(c) for c in df.columns}
-    for c, nc in ncols.items():
-        if nc in targets:
+        return s.strip().lower().replace("-", "").replace("_", "")
+    targets = {INDEX_KEY, "ain10index"}
+    for c in df.columns:
+        if norm(c) in targets:
             return c
     return df.columns[-1]
 
 def _load_df() -> pd.DataFrame:
-    """
-    intraday があれば intraday を優先、無ければ history。
-    先頭列を DatetimeIndex に、数値列以外は落として NA を除去。
-    """
     if INTRADAY_CSV.exists():
         df = pd.read_csv(INTRADAY_CSV, parse_dates=[0], index_col=0)
     elif HISTORY_CSV.exists():
         df = pd.read_csv(HISTORY_CSV, parse_dates=[0], index_col=0)
     else:
-        raise FileNotFoundError("AIN-10: neither intraday nor history csv found.")
-    # 数値化できる列だけに統一
+        raise FileNotFoundError("AIN-10: neither intraday nor history CSV found.")
+    df = df.dropna(how="all")
     for c in list(df.columns):
         df[c] = pd.to_numeric(df[c], errors="coerce")
-    df = df.dropna(how="all")
-    return df
+    return df.dropna(how="all")
 
 # ------------------------
 # chart generation
@@ -93,36 +80,23 @@ def _load_df() -> pd.DataFrame:
 def gen_pngs() -> None:
     df = _load_df()
     col = _pick_index_column(df)
-
     tail_1d = df.tail(1000)
     tail_7d = df.tail(7 * 1000)
-
     _save(tail_1d, col, OUTDIR / f"{INDEX_KEY}_1d.png", f"{INDEX_KEY.upper()} (1d)")
     _save(tail_7d, col, OUTDIR / f"{INDEX_KEY}_7d.png", f"{INDEX_KEY.upper()} (7d)")
     _save(df,      col, OUTDIR / f"{INDEX_KEY}_1m.png", f"{INDEX_KEY.upper()} (1m)")
     _save(df,      col, OUTDIR / f"{INDEX_KEY}_1y.png", f"{INDEX_KEY.upper()} (1y)")
 
 # ------------------------
-# stats (pct) + marker
+# stats writer
 # ------------------------
 def _now_utc_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 def write_stats_and_marker() -> None:
-    """
-    仕様:
-      - intraday の AIN-10 列は “百分率[%]” を直接保持（例: +0.95 は +0.95%）
-      - サイト側は scale=pct として解釈
-      - post_intraday.txt は 「+/-xx.xx%」表記
-    """
     df = _load_df()
     col = _pick_index_column(df)
-
-    pct = None
-    if len(df.index) > 0:
-        last = df[col].iloc[-1]
-        if pd.notna(last):
-            pct = float(last)
+    pct = float(df[col].iloc[-1]) if len(df.index) > 0 and pd.notna(df[col].iloc[-1]) else None
 
     payload = {
         "index_key": INDEX_KEY,
