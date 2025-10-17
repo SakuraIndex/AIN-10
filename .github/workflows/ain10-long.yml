@@ -3,7 +3,8 @@ name: Generate long-term charts (1d/7d/1m/1y + stats + intraday)
 on:
   workflow_dispatch:
   schedule:
-    - cron: "15 20 * * *"   # UTC
+    # UTC。必要に応じて調整（例: 毎日 20:15 UTC）
+    - cron: "15 20 * * *"
 
 permissions:
   contents: write
@@ -13,13 +14,13 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  # ★ リポに合わせて変更可
+  # ★ このリポのインデックスキー（AIN-10）
   INDEX_KEY: ain10
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 12
+    timeout-minutes: 15
 
     steps:
       - name: Checkout
@@ -45,6 +46,7 @@ jobs:
             pip install pandas numpy matplotlib
           fi
 
+      # --- チャート生成（1d/7d/1m/1y、画像やCSVを docs/outputs に出力）---
       - name: Generate long-term charts
         env:
           INDEX_KEY: ${{ env.INDEX_KEY }}
@@ -54,17 +56,19 @@ jobs:
           echo "---- LIST AFTER CHARTS ----"
           ls -al docs/outputs || true
 
-      - name: Compute 1d % for X (update post & stats)
+      # --- 1日騰落率（open→latest）を計算して投稿テキストとJSONを更新 ---
+      - name: Compute 1d percent & write posts
         env:
           INDEX_KEY: ${{ env.INDEX_KEY }}
         run: |
           set -e
-          python scripts/ain10_pct_post.py
-          echo "---- POST (preview) ----"
-          cat docs/outputs/${INDEX_KEY}_post_intraday.txt || true
-          echo "---- STATS (preview) ----"
-          cat docs/outputs/${INDEX_KEY}_stats.json || true
+          python scripts/ain10_pct_post.py \
+            --index-key "${INDEX_KEY}" \
+            --csv "docs/outputs/${INDEX_KEY}_1d.csv" \
+            --out-json "docs/outputs/${INDEX_KEY}_stats.json" \
+            --out-text "docs/outputs/${INDEX_KEY}_post_intraday.txt"
 
+      # （必要なら）成果物をアーティファクトとして保存
       - name: Upload artifacts (for debug)
         if: always()
         uses: actions/upload-artifact@v4
@@ -72,6 +76,7 @@ jobs:
           name: outputs
           path: docs/outputs
 
+      # --- 生成物のコミット ---
       - name: Commit charts if changed
         run: |
           set -e
@@ -84,20 +89,20 @@ jobs:
           git add docs/outputs/${{ env.INDEX_KEY }}_1m.png || true
           git add docs/outputs/${{ env.INDEX_KEY }}_1y.png || true
 
-          # CSV（生成されていれば）
+          # CSV（存在すれば）
           git add docs/outputs/${{ env.INDEX_KEY }}_1d.csv || true
           git add docs/outputs/${{ env.INDEX_KEY }}_7d.csv || true
           git add docs/outputs/${{ env.INDEX_KEY }}_1m.csv || true
           git add docs/outputs/${{ env.INDEX_KEY }}_1y.csv || true
 
-          # stats と X 投稿用テキスト
-          git add docs/outputs/${{ env.INDEX_KEY }}_stats.json        || true
+          # 投稿テキスト・統計
           git add docs/outputs/${{ env.INDEX_KEY }}_post_intraday.txt || true
+          git add docs/outputs/${{ env.INDEX_KEY }}_stats.json || true
 
           if git diff --cached --quiet; then
             echo "No chart/stat updates."
             exit 0
           fi
 
-          git commit -m "chore(charts): update ${{ env.INDEX_KEY }} (1d/7d/1m/1y + stats)"
+          git commit -m "chore(charts): update ${{ env.INDEX_KEY }} (1d/7d/1m/1y + stats + intraday)"
           git push
