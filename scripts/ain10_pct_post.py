@@ -1,119 +1,109 @@
 #!/usr/bin/env python3
-import argparse
-import json
+import argparse, json
 from pathlib import Path
-from datetime import time as dtime
-
-import numpy as np
 import pandas as pd
+import numpy as np
 
-
-def load_series(csv_path: Path) -> pd.DataFrame:
-    df = pd.read_csv(csv_path)
-
-    # 日時検出
-    for c in ["Datetime", "datetime", "timestamp", "time", "date"]:
-        if c in df.columns:
-            df[c] = pd.to_datetime(df[c])
-            df = df.rename(columns={c: "time"})
-            break
-    else:
-        raise ValueError("time column not found in CSV")
-
-    # 値列は最初の数値列を採用（なければ代表候補を数値化）
-    num_cols = [c for c in df.columns if c != "time" and np.issubdtype(df[c].dtype, np.number)]
-    if not num_cols:
-        for c in ["AIN-10", "AIN10", "value", "score", "close", "price", "index"]:
-            if c in df.columns:
-                df[c] = pd.to_numeric(df[c], errors="coerce")
-                num_cols = [c]
-                break
-    if not num_cols:
-        raise ValueError("value column not found in CSV")
-
-    df = df[["time", num_cols[0]]].rename(columns={num_cols[0]: "value"})
-    df = df.sort_values("time").reset_index(drop=True)
+def read_series(path: Path) -> pd.DataFrame:
+    df = pd.read_csv(path)
+    # 列名推定（1列目=時刻/日付、2列目=値）
+    if df.shape[1] < 2:
+        raise ValueError(f"CSV has too few columns: {path}")
+    ts_col = df.columns[0]
+    val_col = df.columns[1]
+    df = df[[ts_col, val_col]].rename(columns={ts_col: "ts", val_col: "value"})
+    # ts は文字列のままでOK（文字列日付も許容）
+    # 数値のみ抽出
+    df["value"] = pd.to_numeric(df["value"], errors="coerce")
+    df = df.dropna(subset=["value"])
     return df
 
+def try_prev_close(history_path: Path) -> float | None:
+    if not history_path.exists():
+        return None
+    h = pd.read_csv(history_path)
+    if h.shape[1] < 2:
+        return None
+    # 末尾の値を「前日終値」とみなす（生成ロジックにより日次末尾が並ぶ前提）
+    val_col = h.columns[1]
+    s = pd.to_numeric(h[val_col], errors="coerce").dropna()
+    return float(s.iloc[-2]) if len(s) >= 2 else (float(s.iloc[-1]) if len(s) >= 1 else None)
 
-def pick_first_last_of_session(df: pd.DataFrame, session: str):
-    """
-    指定セッション（例 "09:30-15:50"）の当日データから first/last を返す。
-    セッションに1件も無ければ、その日の最初/最後をフォールバックとして返す。
-    なければ (None, None)。
-    """
-    s_open, s_close = session.split("-")
-    hh, mm = map(int, s_open.split(":"))
-    open_t = dtime(hh, mm)
-    hh, mm = map(int, s_close.split(":"))
-    close_t = dtime(hh, mm)
-
-    if df.empty:
-        return None, None, None
-
-    latest_day = df["time"].dt.date.iloc[-1]
-    day_df = df[df["time"].dt.date == latest_day].copy()
-
-    if day_df.empty:
-        return None, None, latest_day
-
-    in_sess = day_df[
-        (day_df["time"].dt.time >= open_t) & (day_df["time"].dt.time <= close_t)
-    ]
-    target = in_sess if not in_sess.empty else day_df
-
-    first = target.iloc[0]
-    last = target.iloc[-1]
-    return first, last, latest_day
-
+def safe_pct(num: float, den: float) -> float | None:
+    if den is None: return None
+    if den == 0 or not np.isfinite(den): return None
+    return (num - den) / den * 100.0
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--index-key", required=True)
-    ap.add_argument("--csv", required=True)
+    ap.add_argument("--csv", required=True, help="docs/outputs/ain10_1d.csv")
+    ap.add_argument("--history", default=None, help="docs/outputs/ain10_history.csv（任意）")
     ap.add_argument("--out-json", required=True)
     ap.add_argument("--out-text", required=True)
-    ap.add_argument("--session", default="09:30-15:50")
     args = ap.parse_args()
 
-    df = load_series(Path(args.csv))
+    df = read_series(Path(args.csv))
+    if df.empty:
+        basis = "n/a"; pct = None; valid = "n/a"
+    else:
+        # その日の最初と最後
+        open_val = float(df["value"].iloc[0])
+        last_val = float(df["value"].iloc[-1])
+        valid = f"{str(df['ts'].iloc[0]).split(' ')[0]} first->latest"
 
-    first, last, the_date = pick_first_last_of_session(df, args.session)
+        # しきい値（0 近傍で暴走しないように）
+        MIN_DEN = 0.1
 
-    basis = "n/a"
-    pct_1d = None
+        pct = None
+        basis = None
 
-    if first is not None and last is not None:
-        open_val = float(first["value"])
-        last_val = float(last["value"])
-        if np.isfinite(open_val) and np.isfinite(last_val) and abs(open_val) > 1e-12:
-            pct_1d = (last_val - open_val) / abs(open_val) * 100.0
+        # (1) open が十分大きい
+        if abs(open_val) >= MIN_DEN:
+            pct = safe_pct(last_val, open_val)
             basis = "open"
 
-    # 投稿テキスト
-    if pct_1d is None:
-        post_line = f"{args.index_key.upper()} 1d: A%=N/A (basis={basis} valid=n/a)"
+        # (2) 前日終値が使えそうなら
+        if pct is None and args.history:
+            prev_close = try_prev_close(Path(args.history))
+            if prev_close is not None and abs(prev_close) >= MIN_DEN:
+                pct = safe_pct(last_val, prev_close)
+                basis = "prev_close"
+
+        # (3) その日の絶対最大値でスケール（目安比率）
+        if pct is None:
+            absmax = float(np.nanmax(np.abs(df["value"].to_numpy()))) if len(df) else np.nan
+            if np.isfinite(absmax) and absmax >= MIN_DEN:
+                pct = (last_val - open_val) / absmax * 100.0
+                basis = "absmax"
+
+        # (最終) それでも無理なら N/A
+        if pct is None or not np.isfinite(pct):
+            pct = None
+            basis = "n/a"
+            valid = "n/a"
+
+    # 出力テキスト（レベルΔは常に N/A 固定）
+    if pct is None:
+        line = f"{args.index_key.upper()} 1d: Δ=N/A (level)  A%=N/A (basis={basis} valid={valid})"
+        pct_out = None
     else:
-        sign = "+" if pct_1d >= 0 else ""
-        date_str = str(the_date)
-        post_line = (
-            f"{args.index_key.upper()} 1d: A%={sign}{pct_1d:.2f}% "
-            f"(basis={basis} valid={date_str} first->latest)"
-        )
+        sign_pct = f"{pct:+.2f}%"
+        line = f"{args.index_key.upper()} 1d: Δ=N/A (level)  A%={sign_pct} (basis={basis} valid={valid})"
+        pct_out = float(pct)
 
-    # 保存
-    Path(args.out_text).write_text(post_line + "\n", encoding="utf-8")
+    Path(args.out_text).write_text(line + "\n", encoding="utf-8")
 
-    stats_obj = {
+    # stats.json（サイト用；レベル差は常に N/A）
+    stats = {
         "index_key": args.index_key,
-        "pct_1d": None if pct_1d is None else float(pct_1d),
-        "delta_level": None,         # レベル差はサイト側で使わないので固定
+        "pct_1d": pct_out,
+        "delta_level": None,
         "scale": "level",
         "basis": basis,
         "updated_at": pd.Timestamp.utcnow().isoformat() + "Z",
     }
-    Path(args.out_json).write_text(json.dumps(stats_obj, ensure_ascii=False), encoding="utf-8")
-
+    Path(args.out_json).write_text(json.dumps(stats, ensure_ascii=False), encoding="utf-8")
 
 if __name__ == "__main__":
     main()
