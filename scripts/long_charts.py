@@ -1,154 +1,128 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-AIN10 charts + stats (ASTRA4準拠, レベル系列, dark theme)
-内部では%は出力しない。X投稿用の%は別スクリプト(post_for_x.py)で算出。
+Level-only charts for AIN10 (or any index series)
+- NEVER print % on the figure
+- Minimal, clean title (e.g., "AIN10 (1d)")
+- Robust column detection (time & level)
+- Works for intraday or daily data alike
+- Typical usage:
+    python scripts/long_charts.py \
+        --csv docs/outputs/ain10_1d.csv \
+        --out docs/outputs/ain10_1d.png \
+        --title "AIN10 (1d)"
 """
 
-import json
-from datetime import datetime, timezone
+from __future__ import annotations
+
+import argparse
 from pathlib import Path
+from typing import Optional, Sequence
+
 import pandas as pd
 import matplotlib.pyplot as plt
 
-# ============================
-# 定数 / パス設定
-# ============================
-INDEX_KEY = "ain10"
-OUTDIR = Path("docs/outputs")
-OUTDIR.mkdir(parents=True, exist_ok=True)
 
-HISTORY_CSV  = OUTDIR / f"{INDEX_KEY}_history.csv"
-INTRADAY_CSV = OUTDIR / f"{INDEX_KEY}_intraday.csv"
+# ---------- Default style ----------
+DEFAULT_FIGSIZE = (12, 6)
+DEFAULT_DPI = 160
+TITLE_FONTSIZE = 14
+AXIS_LABEL_FONTSIZE = 11
+TICK_FONTSIZE = 9
+LINEWIDTH = 2.0
+# -----------------------------------
 
-# ============================
-# ダークテーマ設定
-# ============================
-DARK_BG = "#0e0f13"
-DARK_AX = "#0b0c10"
-FG_TEXT = "#e7ecf1"
-GRID    = "#2a2e3a"
-RED     = "#ff6b6b"
-GREEN   = "#28e07c"
-FLAT    = "#9aa3af"
 
-plt.rcParams.update({
-    "figure.facecolor": DARK_BG,
-    "axes.facecolor": DARK_AX,
-    "savefig.facecolor": DARK_BG,
-    "axes.edgecolor": GRID,
-    "grid.color": GRID,
-    "grid.alpha": 0.6,
-    "xtick.color": FG_TEXT,
-    "ytick.color": FG_TEXT,
-    "axes.labelcolor": FG_TEXT,
-    "axes.titlecolor": FG_TEXT,
-})
+def _guess_col(columns: Sequence[str], candidates: Sequence[str]) -> Optional[str]:
+    """Return the first column name (case-insensitive) that matches candidates."""
+    lower_map = {c.lower(): c for c in columns}
+    for cand in candidates:
+        if cand.lower() in lower_map:
+            return lower_map[cand.lower()]
+    return None
 
-# ============================
-# 共通ユーティリティ
-# ============================
-def _apply(ax, title: str) -> None:
-    fig = ax.figure
-    fig.set_size_inches(12, 7)
-    fig.set_dpi(160)
-    for sp in ax.spines.values():
-        sp.set_color(GRID)
-    ax.grid(True)
-    ax.tick_params(colors=FG_TEXT)
-    ax.set_xlabel("Time", color=FG_TEXT)
-    ax.set_ylabel("Index Level", color=FG_TEXT)
-    ax.set_title(title, fontsize=12, color=FG_TEXT)
 
-def _trend_color(series: pd.Series) -> str:
+def load_series(csv_path: Path, tcol: Optional[str] = None, vcol: Optional[str] = None) -> pd.DataFrame:
     """
-    開始値と終値の比較で線色を決定。
+    Load time/value series from CSV. Detect columns if not given.
+    Expected columns (case-insensitive):
+      - time:  one of ["ts","time","timestamp","date","datetime"]
+      - value: one of ["level","value","y","index","score","close","price"]
+    Returns DataFrame with columns ["ts","level"] sorted by ts (datetime64).
     """
-    s = pd.to_numeric(series, errors="coerce").dropna()
-    if s.empty:
-        return FLAT
-    if s.iloc[-1] > s.iloc[0]:
-        return GREEN
-    elif s.iloc[-1] < s.iloc[0]:
-        return RED
-    return FLAT
+    if not csv_path.exists():
+        raise FileNotFoundError(f"CSV not found: {csv_path}")
 
-def _now_utc_iso() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+    df = pd.read_csv(csv_path)
 
-# ============================
-# データ読み込み
-# ============================
-def _load_df() -> pd.DataFrame:
-    """
-    intraday があれば優先、なければ history を使う。
-    indexをDatetimeIndex化し、数値列へ変換。
-    """
-    if INTRADAY_CSV.exists():
-        df = pd.read_csv(INTRADAY_CSV, parse_dates=[0], index_col=0)
-    elif HISTORY_CSV.exists():
-        df = pd.read_csv(HISTORY_CSV, parse_dates=[0], index_col=0)
-    else:
-        raise FileNotFoundError("AIN10: CSV not found")
+    if tcol is None:
+        tcol = _guess_col(df.columns, ["ts", "time", "timestamp", "date", "datetime"])
+    if vcol is None:
+        vcol = _guess_col(df.columns, ["level", "value", "y", "index", "score", "close", "price"])
 
-    for c in df.columns:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
-    df = df.dropna(how="all")
+    if tcol is None or vcol is None:
+        raise ValueError(
+            f"Missing required columns in {csv_path}. "
+            f"Need time∈[ts,time,timestamp,date,datetime], value∈[level,value,y,index,score,close,price]. "
+            f"Found: {list(df.columns)}"
+        )
+
+    df = df[[tcol, vcol]].rename(columns={tcol: "ts", vcol: "level"})
+    df["ts"] = pd.to_datetime(df["ts"], errors="coerce")
+    df = df.dropna(subset=["ts", "level"]).sort_values("ts")
     return df
 
-# ============================
-# チャート生成
-# ============================
-def _plot(df: pd.DataFrame, col: str, out_png: Path, title: str) -> None:
-    fig, ax = plt.subplots()
-    _apply(ax, title)
-    color = _trend_color(df[col])
-    ax.plot(df.index, df[col], color=color, linewidth=1.6)
-    fig.savefig(out_png, bbox_inches="tight", facecolor=DARK_BG)
+
+def render_level_chart(
+    csv_path: Path,
+    out_png: Path,
+    title: str = "AIN10 (1d)",
+    tcol: Optional[str] = None,
+    vcol: Optional[str] = None,
+    figsize=DEFAULT_FIGSIZE,
+    dpi: int = DEFAULT_DPI,
+) -> None:
+    """
+    Render a clean level chart from CSV to PNG.
+    - No percent or stats annotations
+    - Minimal title
+    """
+    df = load_series(csv_path, tcol=tcol, vcol=vcol)
+    if df.empty:
+        raise ValueError(f"No data in {csv_path}")
+
+    fig, ax = plt.subplots(figsize=figsize, dpi=dpi)
+    ax.plot(df["ts"], df["level"], linewidth=LINEWIDTH)
+
+    ax.set_title(title, fontsize=TITLE_FONTSIZE, pad=8)
+    ax.set_xlabel("Time", fontsize=AXIS_LABEL_FONTSIZE)
+    ax.set_ylabel("Index (level)", fontsize=AXIS_LABEL_FONTSIZE)
+    ax.tick_params(axis="both", labelsize=TICK_FONTSIZE)
+    ax.grid(False)
+
+    fig.tight_layout()
+    out_png.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_png)
     plt.close(fig)
 
-def gen_all_charts() -> None:
-    df = _load_df()
-    col = df.columns[-1]
 
-    # intradayの最新データを別ファイルとして保存（post_for_x用）
-    df.tail(1000).to_csv(OUTDIR / f"{INDEX_KEY}_1d.csv")
+def main():
+    p = argparse.ArgumentParser(description="Render level-only chart (no % or stats)")
+    p.add_argument("--csv", type=Path, required=True, help="Input CSV path")
+    p.add_argument("--out", type=Path, required=True, help="Output PNG path")
+    p.add_argument("--title", type=str, default="AIN10 (1d)", help="Figure title")
+    p.add_argument("--tcol", type=str, default=None, help="Explicit time column")
+    p.add_argument("--vcol", type=str, default=None, help="Explicit value/level column")
+    args = p.parse_args()
 
-    # チャート出力
-    _plot(df.tail(1000), col, OUTDIR / f"{INDEX_KEY}_1d.png", f"{INDEX_KEY.upper()} (1d)")
-    _plot(df.tail(7 * 1000), col, OUTDIR / f"{INDEX_KEY}_7d.png", f"{INDEX_KEY.upper()} (7d)")
-    _plot(df, col, OUTDIR / f"{INDEX_KEY}_1m.png", f"{INDEX_KEY.upper()} (1m)")
-    _plot(df, col, OUTDIR / f"{INDEX_KEY}_1y.png", f"{INDEX_KEY.upper()} (1y)")
-
-# ============================
-# 統計ファイル（ASTRA4仕様）
-# ============================
-def write_stats() -> None:
-    df = _load_df()
-    col = df.columns[-1]
-    last = pd.to_numeric(df[col], errors="coerce").dropna().iloc[-1] if len(df) else None
-
-    payload = {
-        "index_key": INDEX_KEY,
-        "pct_1d": None,            # ASTRA4準拠: 常に None
-        "delta_level": float(last) if last is not None else None,
-        "scale": "level",
-        "basis": "n/a",
-        "updated_at": _now_utc_iso(),
-    }
-
-    # JSON出力
-    (OUTDIR / f"{INDEX_KEY}_stats.json").write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+    render_level_chart(
+        csv_path=args.csv,
+        out_png=args.out,
+        title=args.title,
+        tcol=args.tcol,
+        vcol=args.vcol,
     )
 
-    # テキストマーカー
-    marker = OUTDIR / f"{INDEX_KEY}_post_intraday.txt"
-    marker.write_text(f"{INDEX_KEY.upper()} 1d: A%=N/A (basis n/a)\n", encoding="utf-8")
 
-# ============================
-# main
-# ============================
 if __name__ == "__main__":
-    gen_all_charts()
-    write_stats()
+    main()
