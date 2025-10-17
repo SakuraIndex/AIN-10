@@ -58,7 +58,7 @@ def plot_one_span(df: pd.DataFrame, title: str, out_png: Path):
     ax.xaxis.set_minor_locator(MaxNLocator(nbins=50))
 
     fig.tight_layout()
-    fig.savefig(out_png, facecolor=fig.get_facecolor(), bbox_inches="tight")
+    fig.savefig(out_png, facecolor=fig.get_facecolor())
     plt.close(fig)
 
 def subset_for_span(df: pd.DataFrame, span: str) -> pd.DataFrame:
