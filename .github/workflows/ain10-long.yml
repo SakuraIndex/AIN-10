@@ -3,16 +3,19 @@ name: Generate long-term charts (1d/7d/1m/1y + stats + intraday)
 on:
   workflow_dispatch:
   schedule:
-    - cron: "15 20 * * *"   # UTC
+    # 毎日 20:15 UTC（必要に応じて変更）
+    - cron: "15 20 * * *"
 
 permissions:
   contents: write
 
+# 並行実行の衝突を避ける
 concurrency:
   group: long-charts-${{ github.ref }}
   cancel-in-progress: false
 
 env:
+  # このリポのインデックスキー
   INDEX_KEY: ain10
 
 jobs:
@@ -41,10 +44,10 @@ jobs:
           elif [ -f src/requirements.txt ]; then
             pip install -r src/requirements.txt
           else
-            pip install pandas numpy matplotlib pytz python-dateutil
+            pip install pandas numpy matplotlib pytz
           fi
 
-      # 1d/7d/1m/1y の画像と CSV を作る（チャートはダーク/赤、枠線なし）
+      # 1d/7d/1m/1y の画像・CSVを docs/outputs へ生成
       - name: Generate long-term charts
         env:
           INDEX_KEY: ${{ env.INDEX_KEY }}
@@ -54,7 +57,7 @@ jobs:
           echo "---- LIST AFTER CHARTS ----"
           ls -al docs/outputs || true
 
-      # 1日騰落率（X 投稿用の%）を算出して post と stats を更新
+      # 1日騰落率（open→latest などの基準）を計算して投稿文/JSONを書き出し
       - name: Compute 1d percent & write posts
         env:
           INDEX_KEY: ${{ env.INDEX_KEY }}
@@ -63,10 +66,11 @@ jobs:
           python scripts/ain10_pct_post.py \
             --index-key "${INDEX_KEY}" \
             --csv "docs/outputs/${INDEX_KEY}_1d.csv" \
-            --history "docs/outputs/${INDEX_KEY}_history.csv" \
             --out-json "docs/outputs/${INDEX_KEY}_stats.json" \
-            --out-text "docs/outputs/${INDEX_KEY}_post_intraday.txt"
+            --out-text "docs/outputs/${INDEX_KEY}_post_intraday.txt" \
+            --basis open
 
+      # デバッグ用に成果物を保存（任意）
       - name: Upload artifacts (for debug)
         if: always()
         uses: actions/upload-artifact@v4
@@ -74,6 +78,7 @@ jobs:
           name: outputs
           path: docs/outputs
 
+      # 生成物のコミット
       - name: Commit charts if changed
         run: |
           set -e
@@ -86,12 +91,11 @@ jobs:
           git add docs/outputs/${{ env.INDEX_KEY }}_1m.png || true
           git add docs/outputs/${{ env.INDEX_KEY }}_1y.png || true
 
-          # CSV
+          # CSV（存在すれば）
           git add docs/outputs/${{ env.INDEX_KEY }}_1d.csv || true
           git add docs/outputs/${{ env.INDEX_KEY }}_7d.csv || true
           git add docs/outputs/${{ env.INDEX_KEY }}_1m.csv || true
           git add docs/outputs/${{ env.INDEX_KEY }}_1y.csv || true
-          git add docs/outputs/${{ env.INDEX_KEY }}_history.csv || true
 
           # 投稿テキスト・統計
           git add docs/outputs/${{ env.INDEX_KEY }}_post_intraday.txt || true
