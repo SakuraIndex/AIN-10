@@ -1,135 +1,119 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import argparse
+import os
 import json
 from pathlib import Path
-from datetime import datetime, timezone
-
+import argparse
 import pandas as pd
+from datetime import timezone
 
-
-def now_iso() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
-def read_two_col_series(csv_path: Path) -> pd.DataFrame:
-    """先頭列=日時, 2列目=値 として読み込む（列名に依存しない）"""
+def load_series(csv_path: Path) -> pd.DataFrame:
     df = pd.read_csv(csv_path)
     if df.shape[1] < 2:
-        raise ValueError(f"CSV has insufficient columns: {csv_path}")
-    ts_col = df.columns[0]
-    val_col = df.columns[1]
-    df = pd.DataFrame({
-        "ts": pd.to_datetime(df[ts_col], errors="coerce"),
-        "val": pd.to_numeric(df[val_col], errors="coerce"),
-    }).dropna(subset=["ts", "val"]).sort_values("ts").reset_index(drop=True)
+        raise ValueError(f"CSV needs >=2 columns: {csv_path}")
+    ts_col, val_col = df.columns[0], df.columns[1]
+    df = df.rename(columns={ts_col: "ts", val_col: "val"})
+    df["ts"] = pd.to_datetime(df["ts"], utc=False, errors="coerce")
+    df = df.dropna(subset=["ts", "val"]).sort_values("ts").reset_index(drop=True)
     return df
 
+def last_trading_day(df: pd.DataFrame):
+    return df["ts"].dt.floor("D").max()
 
-def safe_pct(numer: float, denom: float) -> float | None:
-    if denom is None or denom == 0:
-        return None
-    try:
-        return (numer / denom) * 100.0
-    except Exception:
-        return None
-
-
-def compute_basis_value(basis: str, intraday_df: pd.DataFrame,
-                        history_path: Path | None) -> tuple[float | None, str]:
+def compute_basis_value(df: pd.DataFrame, basis: str):
     """
-    basis を解決して基準値を返す。
-    - open: intraday の最初の有効値
-    - prev_close: history CSV（任意）から直近クローズ。無ければ None
-    - prev_any: 取りうる最も直近の値（intraday先頭でも可）
+    basis:
+      - 'open'       : 当日(最新日)の最初の値
+      - 'prev_close' : 前営業日の最後の値
+      - 'prev_any'   : 当日最初の点の直前の値（直近のティック）
     """
-    if intraday_df.empty:
-        return None, "n/a"
+    if df.empty:
+        return None, None, None
+
+    d_last = last_trading_day(df)
+    day_df = df[df["ts"].dt.floor("D") == d_last].sort_values("ts")
+    if day_df.empty:
+        return None, None, None
+
+    first = day_df.iloc[0]
+    last = day_df.iloc[-1]
 
     if basis == "open":
-        return float(intraday_df["val"].iloc[0]), "open"
+        base = first["val"]
+        base_ts = first["ts"]
+    elif basis == "prev_close":
+        prev_df = df[df["ts"] < first["ts"]]
+        if prev_df.empty:
+            return None, first["ts"], last["ts"]
+        base = prev_df.iloc[-1]["val"]
+        base_ts = prev_df.iloc[-1]["ts"]
+    elif basis == "prev_any":
+        prev_df = df[df["ts"] < first["ts"]]
+        if prev_df.empty:
+            return None, first["ts"], last["ts"]
+        base = prev_df.iloc[-1]["val"]
+        base_ts = prev_df.iloc[-1]["ts"]
+    else:
+        raise ValueError("invalid basis")
 
-    if basis == "prev_any":
-        return float(intraday_df["val"].iloc[0]), "prev_any"
+    return (float(base) if base is not None else None), pd.Timestamp(base_ts), pd.Timestamp(last["ts"])
 
-    if basis == "prev_close":
-        if history_path and Path(history_path).exists():
-            try:
-                h = read_two_col_series(Path(history_path))
-                if not h.empty:
-                    return float(h["val"].iloc[-1]), "prev_close"
-            except Exception:
-                pass
-        return None, "prev_close"  # 情報無しでも落とさない
+def compute_pct_1d(df: pd.DataFrame, basis: str):
+    base, ts0, ts1 = compute_basis_value(df, basis)
+    if base is None or base == 0:
+        return None, None, ts0, ts1
 
-    # 不明指定は open 扱い
-    return float(intraday_df["val"].iloc[0]), "open"
+    d_last = last_trading_day(df)
+    day_df = df[df["ts"].dt.floor("D") == d_last].sort_values("ts")
+    if day_df.empty:
+        return None, None, ts0, ts1
+    last_val = float(day_df.iloc[-1]["val"])
+    delta_level = last_val - base
+    pct = (delta_level / abs(base)) * 100.0
+    return pct, delta_level, ts0, ts1
 
+def iso_now():
+    return pd.Timestamp.utcnow().tz_localize("UTC").isoformat()
 
 def main():
-    ap = argparse.ArgumentParser(description="Compute 1d percent & write posts")
+    ap = argparse.ArgumentParser(description="Compute 1d percent and write posts/json")
     ap.add_argument("--index-key", required=True, dest="index_key")
-    ap.add_argument("--csv", required=True, help="intraday 1d CSV path")
+    ap.add_argument("--csv", required=True, dest="csv")
     ap.add_argument("--out-json", required=True, dest="out_json")
     ap.add_argument("--out-text", required=True, dest="out_text")
-    ap.add_argument("--basis", choices=["open", "prev_close", "prev_any"],
-                    default="open", help="percent basis (default: open)")
-    ap.add_argument("--history", default=None,
-                    help="optional history CSV (for prev_close)")
+    ap.add_argument("--basis", choices=["open", "prev_close", "prev_any"], default="open")
     args = ap.parse_args()
 
-    csv_path = Path(args.csv)
-    df = read_two_col_series(csv_path)
-    updated_at = now_iso()
+    df = load_series(Path(args.csv))
+    pct, delta_level, ts0, ts1 = compute_pct_1d(df, args.basis)
 
-    # デフォルト（計算不能時）
-    pct_1d = None
-    delta_level = None
-    valid_str = "n/a"
-
-    if not df.empty:
-        first_ts = df["ts"].iloc[0]
-        last_ts = df["ts"].iloc[-1]
-        last_val = float(df["val"].iloc[-1])
-
-        basis_val, basis_used = compute_basis_value(args.basis, df,
-                                                    Path(args.history) if args.history else None)
-        if basis_val is not None:
-            delta_level = last_val - basis_val
-            pct_1d = safe_pct(delta_level, basis_val)
-            valid_str = f"{first_ts.strftime('%Y-%m-%d %H:%M')}->{last_ts.strftime('%Y-%m-%d %H:%M')}"
-        else:
-            basis_used = args.basis
-
-    # JSON 出力
-    out_json = {
+    # ----- JSON (stats) -----
+    stats = {
         "index_key": args.index_key,
-        "pct_1d": float(pct_1d) if pct_1d is not None else None,
-        "delta_level": float(delta_level) if delta_level is not None else None,
+        "pct_1d": (None if pct is None else float(pct)),
+        "delta_level": (None if delta_level is None else float(delta_level)),
         "scale": "level",
         "basis": args.basis,
-        "updated_at": updated_at,
+        "updated_at": iso_now(),
     }
-    Path(args.out_json).parent.mkdir(parents=True, exist_ok=True)
-    with open(args.out_json, "w", encoding="utf-8") as f:
-        json.dump(out_json, f, ensure_ascii=False)
+    Path(args.out_json).write_text(json.dumps(stats, ensure_ascii=False))
 
-    # テキスト出力
-    def fmt_pct(p):
-        return f"{p:+.2f}%" if p is not None else "N/A"
+    # ----- TEXT (post) -----
+    if ts0 is not None and ts1 is not None:
+        valid_str = f"{ts0.strftime('%Y-%m-%d %H:%M')}→{ts1.strftime('%Y-%m-%d %H:%M')}"
+    else:
+        valid_str = "n/a"
 
-    def fmt_delta(d):
-        return f"{d:+.6f}" if d is not None else "N/A"
+    if pct is None or delta_level is None:
+        line = f"{args.index_key.upper()} 1d: Δ=N/A (level) A%=N/A (basis={args.basis} valid={valid_str})"
+    else:
+        line = (
+            f"{args.index_key.upper()} 1d: Δ={delta_level:.6f} (level) "
+            f"A%={pct:+.2f}% (basis={args.basis} valid={valid_str})"
+        )
 
-    line = (f"{args.index_key.upper()} 1d: Δ={fmt_delta(delta_level)} (level) "
-            f"A%={fmt_pct(pct_1d)} (basis={args.basis} valid={valid_str})")
-
-    with open(args.out_text, "w", encoding="utf-8") as f:
-        f.write(line + "\n")
-
-    print("[OK] wrote:", args.out_json, "and", args.out_text)
-
+    Path(args.out_text).write_text(line + "\n")
 
 if __name__ == "__main__":
     main()
