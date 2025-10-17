@@ -1,1 +1,1 @@
-AIN10 1d: Δ=-0.856514 (level) A%=+0.00% (basis=open valid=2025-10-16 open -> latest)
+AIN10 1d: A%=+0.00% (basis=open valid=2025-10-16 open -> latest)
