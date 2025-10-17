@@ -1,1 +1,1 @@
-AIN10 1d: Δ=-0.856514 (level)  A%=-34.56% (basis=range first-row valid=2025-10-16T09:30:00->2025-10-16T15:50:00)
+AIN10 1d: Δ=-0.856514 (level) A%=-134.01% (basis=stdev first-row valid=2025-10-16T09:30:00->2025-10-16T15:50:00)
