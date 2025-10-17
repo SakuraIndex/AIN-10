@@ -2,15 +2,14 @@
 # -*- coding: utf-8 -*-
 
 """
-AIN-10: level + percent(range-based) charts & stats
-
-- 1d/7d/1m/1y のPNGを生成（余計な注釈なし、タイトルのみ）
-- post_intraday.txt: "Δ(level) と Δ%(range)" を併記。レンジ極小は N/A。
-- *_stats.json: {"index_key","pct_1d","delta_level","scale","updated_at"}
-  pct_1d はレンジ極小時は null
-
-※ range-based % = (last - first) / (high - low) * 100
-  level系インジケータが 0 付近を跨いでも暴れにくい定義。
+AIN-10: 1d/7d/1m/1y のチャート生成 + 統計出力（%は異常値回避のハイブリッド方式）
+- %は以下のハイブリッドで安定化
+  1) 通常:    A% = (last - first) / abs(first) * 100 （基準=first-row）
+  2) 例外時:  |first| が小さすぎる場合は range 法に自動切替
+              A% = (last - first) / (max - min) * 100 （基準=range）
+  → どちらを使ったかは出力テキストに basis=... で明記
+- 画像上の注記（Δや%のテキスト）は描かない（タイトルのみ）
+- *_stats.json には level 差分と % を併記
 """
 
 from pathlib import Path
@@ -19,17 +18,19 @@ import json
 import pandas as pd
 import matplotlib.pyplot as plt
 
-# ===== 設定 =====
-INDEX_KEY = "ain10"  # ← AIN-10
+# =========================
+# 設定
+# =========================
+INDEX_KEY = "ain10"
 OUTDIR = Path("docs/outputs"); OUTDIR.mkdir(parents=True, exist_ok=True)
-HISTORY_CSV = OUTDIR / f"{INDEX_KEY}_history.csv"
+HISTORY_CSV  = OUTDIR / f"{INDEX_KEY}_history.csv"
 INTRADAY_CSV = OUTDIR / f"{INDEX_KEY}_intraday.csv"
 
-# ---- 統一カラー（ダーク） ----
-FIG_BG = "#0e0f13"  # figure背景
+# 統一カラー
+FIG_BG = "#0e0f13"  # figure 背景
 AX_BG  = "#0b0c10"  # 軸エリア背景
 GRID   = "#2a2e3a"
-LINE   = "#ff6b63"
+LINE   = "#ff6b6b"  # AIN10 は視認性重視で暖色に
 FG     = "#e7ecf1"
 
 plt.rcParams.update({
@@ -41,117 +42,149 @@ plt.rcParams.update({
     "axes.labelcolor": FG,
     "xtick.color": FG,
     "ytick.color": FG,
-    "font.size": 12,
+    "grid.color": GRID,
 })
 
-EPS = 1e-9  # ゼロ割回避
+# =========================
+# ユーティリティ
+# =========================
+def _now_utc_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
-# ===== 共通 =====
 def _load_df() -> pd.DataFrame:
+    """
+    intraday があればそれを優先、無ければ history を使う。
+    """
     csv = INTRADAY_CSV if INTRADAY_CSV.exists() else HISTORY_CSV
     df = pd.read_csv(csv, parse_dates=[0], index_col=0)
     for c in df.columns:
         df[c] = pd.to_numeric(df[c], errors="coerce")
     return df.dropna(how="all")
 
-def _calc_delta_and_pct_range(df: pd.DataFrame, col: str):
-    """Δ(level) と レンジ基準の％を返す。レンジ極小は pct=None。"""
-    if df.empty:
-        return None, None, None, None
-    first = float(df[col].iloc[0])
-    last  = float(df[col].iloc[-1])
-    high  = float(df[col].max())
-    low   = float(df[col].min())
-    delta_level = last - first
-    rng = high - low
-    if rng <= EPS:
-        pct = None  # レンジが実質ゼロ → ％は定義しない
-    else:
-        pct = (delta_level / rng) * 100.0
-    return delta_level, pct, (first, last), (low, high)
+def _compute_changes(s: pd.Series):
+    """
+    Δ(level) と A%(ハイブリッド) を計算し、basis を返す。
+    - 通常は first-row 基準
+    - first が小さ過ぎる場合は range 法に自動切替
+    """
+    s = s.dropna()
+    if len(s) < 2:
+        return 0.0, 0.0, "n/a"
 
-# ===== 作図 =====
-def _plot(df, col, out_png, title):
+    first = float(s.iloc[0])
+    last  = float(s.iloc[-1])
+    delta_level = last - first
+
+    smax = float(s.max())
+    smin = float(s.min())
+    rng  = smax - smin
+
+    # first が十分大きいかを “range 比” で判定（しきい値は 10%）
+    eps = max(1e-12, 0.10 * (rng if rng > 0 else 1.0))
+
+    if abs(first) >= eps:
+        pct = (delta_level / abs(first)) * 100.0
+        basis = "first-row"
+    else:
+        # range 法（rng==0 の場合は 0%）
+        pct = (delta_level / rng * 100.0) if rng > 0 else 0.0
+        basis = "range"
+
+    return delta_level, pct, basis
+
+def _plot(df: pd.DataFrame, col: str, out_png: Path, title: str):
+    """
+    タイトル以外の注記は描かない。背景はダーク、線は見やすい赤系。
+    """
     fig, ax = plt.subplots(figsize=(12, 7), dpi=160)
 
-    # 背景塗りつぶしを確実に
+    # 背景を念のため明示
     fig.patch.set_facecolor(FIG_BG)
     ax.set_facecolor(AX_BG)
     ax.patch.set_facecolor(AX_BG)
 
-    # 枠・グリッド
+    # グリッド & 軸スタイル
     for sp in ax.spines.values():
         sp.set_color(GRID)
-    ax.grid(color=GRID, linewidth=0.8, alpha=0.6)
-
-    # 軸 & タイトル（数値の注釈は載せない）
-    ax.set_title(title, color=FG)
+    ax.grid(True, linewidth=0.8, alpha=0.6)
+    ax.tick_params(colors=FG)
+    ax.set_title(title, color=FG, pad=12)
     ax.set_xlabel("Time", color=FG)
     ax.set_ylabel("Index (level)", color=FG)
 
-    # ライン
-    ax.plot(df.index, df[col], linewidth=1.7, color=LINE)
+    ax.plot(df.index, df[col], color=LINE, linewidth=1.8)
 
-    # 余白を少し確保して保存
-    fig.savefig(out_png, bbox_inches="tight", facecolor=FIG_BG, edgecolor=FIG_BG, transparent=False)
+    fig.savefig(
+        out_png,
+        bbox_inches="tight",
+        facecolor=FIG_BG,
+        edgecolor=FIG_BG,
+        transparent=False,
+    )
     plt.close(fig)
 
+# =========================
+# メイン処理
+# =========================
 def gen_all():
     df = _load_df()
-    if df.empty:
-        return
-    col = df.columns[-1]
+    col = df.columns[-1]  # 最新カラムを描画対象に
 
-    # 期間別
-    _plot(df.tail(1000), col, OUTDIR / f"{INDEX_KEY}_1d.png", f"{INDEX_KEY.upper()} (1d)")
-    _plot(df.tail(7*1000), col, OUTDIR / f"{INDEX_KEY}_7d.png", f"{INDEX_KEY.upper()} (7d)")
-    _plot(df, col, OUTDIR / f"{INDEX_KEY}_1m.png", f"{INDEX_KEY.upper()} (1m)")
-    _plot(df, col, OUTDIR / f"{INDEX_KEY}_1y.png", f"{INDEX_KEY.upper()} (1y)")
+    # 1d/7d/1m/1y
+    _plot(df.tail(1000),     col, OUTDIR / f"{INDEX_KEY}_1d.png", f"{INDEX_KEY.upper()} (1d)")
+    _plot(df.tail(7*1000),   col, OUTDIR / f"{INDEX_KEY}_7d.png", f"{INDEX_KEY.upper()} (7d)")
+    _plot(df,                col, OUTDIR / f"{INDEX_KEY}_1m.png", f"{INDEX_KEY.upper()} (1m)")
+    _plot(df,                col, OUTDIR / f"{INDEX_KEY}_1y.png", f"{INDEX_KEY.upper()} (1y)")
 
-# ===== 出力（テキスト/JSON） =====
 def write_stats_and_post():
     df = _load_df()
-    if df.empty:
-        # 何も書かない
+    col = df.columns[-1]
+    s   = df[col].dropna()
+
+    if len(s) == 0:
+        # 何も無ければ空で返す
+        payload = {
+            "index_key": INDEX_KEY,
+            "pct_1d": None,
+            "delta_level": None,
+            "scale": "level",
+            "updated_at": _now_utc_iso(),
+        }
+        (OUTDIR / f"{INDEX_KEY}_stats.json").write_text(
+            json.dumps(payload, ensure_ascii=False), encoding="utf-8"
+        )
         return
 
-    col = df.columns[-1]
-    delta_level, pct, (first, last), (low, high) = _calc_delta_and_pct_range(df, col)
+    # 直近 1d 相当（ファイルの粒度次第だが、ここでは全体を「当日窓」として扱う）
+    delta_level, pct_1d, basis = _compute_changes(s)
 
-    # --- stats.json ---
-    stats_payload = {
+    # JSON（ダッシュボード/機械読取用）
+    payload = {
         "index_key": INDEX_KEY,
-        "pct_1d": (None if pct is None else float(pct)),  # null or number
-        "delta_level": (None if delta_level is None else float(delta_level)),
+        "pct_1d": pct_1d,                 # %（ハイブリッド・basisはテキスト出力で明示）
+        "delta_level": delta_level,       # level差分
         "scale": "level",
-        "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+        "updated_at": _now_utc_iso(),
     }
     (OUTDIR / f"{INDEX_KEY}_stats.json").write_text(
-        json.dumps(stats_payload, ensure_ascii=False), encoding="utf-8"
+        json.dumps(payload, ensure_ascii=False), encoding="utf-8"
     )
 
-    # --- post_intraday.txt ---
-    # 表記例: "AIN10 1d: Δ=-0.856514 (level) Δ%=+12.34% (basis=range first-row valid=...)"
-    # レンジ極小時は Δ%=N/A
-    if pct is None:
-        pct_str = "N/A"
-    else:
-        pct_str = f"{pct:+.2f}%"
-
-    # 期間（first行のUTC→last行のUTC）
-    start_ts = df.index[0].strftime("%Y-%m-%dT%H:%M:%S%z")
-    end_ts   = df.index[-1].strftime("%Y-%m-%dT%H:%M:%S%z")
-    # GitHub上では %z が +0000 形式になることがあるため、見た目整え
-    start_ts = start_ts[:-2] + ":" + start_ts[-2:] if len(start_ts) >= 5 else start_ts
-    end_ts   = end_ts[:-2]   + ":" + end_ts[-2:]   if len(end_ts) >= 5 else end_ts
-
+    # テキスト（人間向けログ）
+    # 例: "AIN10 1d: Δ=-0.856514 (level)  A%=-34.56% (basis=range first-row valid=...->...)"
+    first_ts = s.index[0].isoformat()
+    last_ts  = s.index[-1].isoformat()
     line = (
-        f"{INDEX_KEY.upper()} 1d: Δ={delta_level:+.6f} (level) "
-        f"Δ%={pct_str} (basis=range first-row valid={start_ts}->{end_ts})"
+        f"{INDEX_KEY.upper()} 1d: "
+        f"Δ={delta_level:+.6f} (level)  "
+        f"A%={pct_1d:+.2f}% (basis={basis} "
+        f"first-row valid={first_ts}->{last_ts})"
     )
-    (OUTDIR / f"{INDEX_KEY}_post_intraday.txt").write_text(line + "\n", encoding="utf-8")
+    (OUTDIR / f"{INDEX_KEY}_post_intraday.txt").write_text(line, encoding="utf-8")
 
-# ===== エントリ =====
-if __name__ == "__main__":
+def main():
     gen_all()
     write_stats_and_post()
+
+if __name__ == "__main__":
+    main()
