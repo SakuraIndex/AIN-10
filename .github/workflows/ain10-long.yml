@@ -1,4 +1,4 @@
-name: Generate long-term charts (1d/7d/1m/1y + volume)
+name: Generate long-term charts (1d/7d/1m/1y + stats + intraday post)
 
 on:
   workflow_dispatch:
@@ -8,6 +8,7 @@ on:
 permissions:
   contents: write
 
+# 同時実行の衝突を避ける
 concurrency:
   group: long-charts-${{ github.ref }}
   cancel-in-progress: false
@@ -36,34 +37,31 @@ jobs:
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then
-            pip install -r requirements.txt
-          elif [ -f src/requirements.txt ]; then
+          if [ -f src/requirements.txt ]; then
             pip install -r src/requirements.txt
           else
             pip install pandas numpy matplotlib
           fi
 
+      # 1) 1d/7d/1m/1y のチャート＋補助CSVを生成（％は描かない・背景ダーク・線赤）
       - name: Generate long-term charts
         env:
           INDEX_KEY: ${{ env.INDEX_KEY }}
         run: |
-          set -euo pipefail
+          set -e
+          python scripts/long_charts.py
+          echo "---- LIST AFTER long_charts ----"
+          ls -al docs/outputs || true
 
-          CSV_DIR="docs/outputs"
-          OUT_DIR="docs/outputs"
-          TITLE_PREFIX=$(printf "%s" "${INDEX_KEY}" | tr '[:lower:]' '[:upper:]')
-
-          echo "---- INPUT CSVs ----"
-          ls -al "${CSV_DIR}" || true
-
-          python scripts/long_charts.py --csv "${CSV_DIR}/${INDEX_KEY}_1d.csv" --out "${OUT_DIR}/${INDEX_KEY}_1d.png" --title "${TITLE_PREFIX} (1d)"
-          python scripts/long_charts.py --csv "${CSV_DIR}/${INDEX_KEY}_7d.csv" --out "${OUT_DIR}/${INDEX_KEY}_7d.png" --title "${TITLE_PREFIX} (7d)"
-          python scripts/long_charts.py --csv "${CSV_DIR}/${INDEX_KEY}_1m.csv" --out "${OUT_DIR}/${INDEX_KEY}_1m.png" --title "${TITLE_PREFIX} (1m)"
-          python scripts/long_charts.py --csv "${CSV_DIR}/${INDEX_KEY}_1y.csv" --out "${OUT_DIR}/${INDEX_KEY}_1y.png" --title "${TITLE_PREFIX} (1y)"
-
-          echo "---- LIST AFTER ----"
-          ls -al "${OUT_DIR}" || true
+      # 2) X投稿用の当日騰落率(%)を計算して post_intraday.txt / stats.json を更新
+      - name: Make intraday post (pct for X)
+        env:
+          INDEX_KEY: ${{ env.INDEX_KEY }}
+        run: |
+          set -e
+          python scripts/make_intraday_post.py
+          echo "---- LIST AFTER intraday post ----"
+          ls -al docs/outputs || true
 
       - name: Upload artifacts (for debug)
         if: always()
@@ -90,7 +88,7 @@ jobs:
           git add docs/outputs/${{ env.INDEX_KEY }}_1m.csv || true
           git add docs/outputs/${{ env.INDEX_KEY }}_1y.csv || true
 
-          # ★ サイトが使う stats/marker も必ずコミット
+          # ★ サイト/投稿が使う stats/marker も必ずコミット
           git add docs/outputs/${{ env.INDEX_KEY }}_stats.json        || true
           git add docs/outputs/${{ env.INDEX_KEY }}_post_intraday.txt || true
 
@@ -99,5 +97,5 @@ jobs:
             exit 0
           fi
 
-          git commit -m "chore(charts): update ${{ env.INDEX_KEY }} (1d/7d/1m/1y + stats)"
+          git commit -m "chore(charts): update ${{ env.INDEX_KEY }} (1d/7d/1m/1y + stats + intraday)"
           git push
