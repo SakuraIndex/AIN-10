@@ -1,1 +1,1 @@
-AIN10 1d: A%=N/A (basis=n/a valid=n/a)
+AIN10 1d: Δ=N/A (level)  A%=-100.39% (basis=prev_close valid=2025-10-16 first->latest)
