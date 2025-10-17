@@ -24,13 +24,17 @@ def read_1d(csv_path: Path) -> pd.DataFrame:
     return df
 
 def percent_change(first: float, last: float) -> float | None:
-    if first is None or last is None:
+    """NaNや0割防止付きの単純騰落率(%単位)"""
+    try:
+        if first is None or last is None:
+            return None
+        if pd.isna(first) or pd.isna(last):
+            return None
+        if abs(float(first)) < 1e-9:  # ← 許容範囲を緩く
+            return None
+        return (float(last) - float(first)) / abs(float(first)) * 100.0
+    except Exception:
         return None
-    if not (math.isfinite(first) and math.isfinite(last)):
-        return None
-    if abs(first) < 1e-12:
-        return None
-    return (last - first) / abs(first) * 100.0
 
 def main():
     ap = argparse.ArgumentParser()
