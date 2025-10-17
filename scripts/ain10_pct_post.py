@@ -1,60 +1,71 @@
-# scripts/ain10_pct_post.py
+#!/usr/bin/env python3
 import argparse
 import json
 from pathlib import Path
-import math
+from datetime import time as dtime
+
+import numpy as np
 import pandas as pd
 
-TIME_CANDIDATES = ["Datetime", "datetime", "timestamp", "time", "date", "Date", "Timestamp"]
 
-def pick_time_column(df: pd.DataFrame) -> str:
-    for c in TIME_CANDIDATES:
+def load_series(csv_path: Path) -> pd.DataFrame:
+    df = pd.read_csv(csv_path)
+
+    # 日時検出
+    for c in ["Datetime", "datetime", "timestamp", "time", "date"]:
         if c in df.columns:
-            return c
-    # インデックスが日時ならそれを使う
-    if isinstance(df.index, pd.DatetimeIndex):
-        df = df.reset_index()
-        return "index"
-    raise ValueError(f"Time column not found. Columns={list(df.columns)}")
+            df[c] = pd.to_datetime(df[c])
+            df = df.rename(columns={c: "time"})
+            break
+    else:
+        raise ValueError("time column not found in CSV")
 
-def pick_value_column(df: pd.DataFrame, index_key: str, time_col: str) -> str:
-    # INDEX_KEY と一致/関連しそうな列を優先（大文字・ハイフン差異も吸収）
-    key_variants = {
-        index_key.lower(),
-        index_key.upper(),
-        index_key.replace("_", "-").upper(),
-        index_key.replace("-", "_").lower(),
-    }
-    for c in df.columns:
-        if c == time_col:
-            continue
-        cn = str(c)
-        if cn.lower() in key_variants or cn.upper() in key_variants:
-            return c
-        # AIN-10 のようにハイフンを含むケース
-        if cn.replace("_", "-").lower() in key_variants:
-            return c
-        if cn.replace("-", "_").lower() in key_variants:
-            return c
+    # 値列は最初の数値列を採用（なければ代表候補を数値化）
+    num_cols = [c for c in df.columns if c != "time" and np.issubdtype(df[c].dtype, np.number)]
+    if not num_cols:
+        for c in ["AIN-10", "AIN10", "value", "score", "close", "price", "index"]:
+            if c in df.columns:
+                df[c] = pd.to_numeric(df[c], errors="coerce")
+                num_cols = [c]
+                break
+    if not num_cols:
+        raise ValueError("value column not found in CSV")
 
-    # 数値列のうち最後の列を採用（時間列は除外）
-    numeric_cols = [c for c in df.columns if c != time_col and pd.api.types.is_numeric_dtype(df[c])]
-    if not numeric_cols:
-        raise ValueError("No numeric value column found.")
-    return numeric_cols[-1]
+    df = df[["time", num_cols[0]]].rename(columns={num_cols[0]: "value"})
+    df = df.sort_values("time").reset_index(drop=True)
+    return df
 
-def safe_pct(latest: float, base: float):
-    if base is None or latest is None:
-        return None
-    if isinstance(base, float) and (math.isnan(base) or base == 0.0):
-        return None
-    if isinstance(latest, float) and math.isnan(latest):
-        return None
-    pct = (latest / base - 1.0) * 100.0
-    # 明らかな外れ値を弾く（データ欠損の可能性）
-    if abs(pct) > 50.0:
-        return None
-    return pct
+
+def pick_first_last_of_session(df: pd.DataFrame, session: str):
+    """
+    指定セッション（例 "09:30-15:50"）の当日データから first/last を返す。
+    セッションに1件も無ければ、その日の最初/最後をフォールバックとして返す。
+    なければ (None, None)。
+    """
+    s_open, s_close = session.split("-")
+    hh, mm = map(int, s_open.split(":"))
+    open_t = dtime(hh, mm)
+    hh, mm = map(int, s_close.split(":"))
+    close_t = dtime(hh, mm)
+
+    if df.empty:
+        return None, None, None
+
+    latest_day = df["time"].dt.date.iloc[-1]
+    day_df = df[df["time"].dt.date == latest_day].copy()
+
+    if day_df.empty:
+        return None, None, latest_day
+
+    in_sess = day_df[
+        (day_df["time"].dt.time >= open_t) & (day_df["time"].dt.time <= close_t)
+    ]
+    target = in_sess if not in_sess.empty else day_df
+
+    first = target.iloc[0]
+    last = target.iloc[-1]
+    return first, last, latest_day
+
 
 def main():
     ap = argparse.ArgumentParser()
@@ -62,83 +73,47 @@ def main():
     ap.add_argument("--csv", required=True)
     ap.add_argument("--out-json", required=True)
     ap.add_argument("--out-text", required=True)
+    ap.add_argument("--session", default="09:30-15:50")
     args = ap.parse_args()
 
-    index_key = args.index_key
-    csv_path = Path(args.csv)
-    out_json = Path(args.out_json)
-    out_text = Path(args.out_text)
+    df = load_series(Path(args.csv))
 
-    if not csv_path.exists():
-        # 生成物がないときは N/A で書く
-        msg = f"{index_key.upper()} 1d: A%=N/A (basis=n/a valid=n/a)"
-        out_text.write_text(msg + "\n", encoding="utf-8")
-        out_json.write_text(json.dumps({
-            "index_key": index_key,
-            "pct_1d": None,
-            "delta_level": None,
-            "scale": "level",
-            "basis": "n/a",
-            "updated_at": pd.Timestamp.utcnow().isoformat(timespec="seconds") + "Z",
-        }), encoding="utf-8")
-        return
+    first, last, the_date = pick_first_last_of_session(df, args.session)
 
-    df = pd.read_csv(csv_path)
-    # 時間列の抽出
-    time_col = pick_time_column(df)
-    if time_col == "index":
-        df["time"] = pd.to_datetime(df["index"])
-        time_col = "time"
-    else:
-        df[time_col] = pd.to_datetime(df[time_col], errors="coerce")
+    basis = "n/a"
+    pct_1d = None
 
-    # 値列の抽出
-    val_col = pick_value_column(df, index_key, time_col)
-
-    # 時間でソート & 最新日を特定
-    df = df.dropna(subset=[time_col]).sort_values(time_col).reset_index(drop=True)
-    if df.empty:
-        basis = "n/a"
-        pct = None
-    else:
-        latest_ts = df[time_col].iloc[-1]
-        latest_date = latest_ts.date()
-
-        # 最新日の「最初の行」を open とする（取引所の正確な 09:30 が無くても、その日の最初でOK）
-        day_mask = df[time_col].dt.date == latest_date
-        day_df = df.loc[day_mask]
-        if len(day_df) >= 2:
-            open_val = day_df[val_col].iloc[0]
-            latest_val = day_df[val_col].iloc[-1]
-            pct = safe_pct(latest_val, open_val)
+    if first is not None and last is not None:
+        open_val = float(first["value"])
+        last_val = float(last["value"])
+        if np.isfinite(open_val) and np.isfinite(last_val) and abs(open_val) > 1e-12:
+            pct_1d = (last_val - open_val) / abs(open_val) * 100.0
             basis = "open"
-            valid = f"{latest_date} first->latest"
-        else:
-            # その日のデータが 1本しかない/ない → N/A（無理に prev_any は使わない）
-            pct = None
-            basis = "n/a"
-            valid = "n/a"
 
-    # 出力
-    if pct is None:
-        pct_str = "N/A"
+    # 投稿テキスト
+    if pct_1d is None:
+        post_line = f"{args.index_key.upper()} 1d: A%=N/A (basis={basis} valid=n/a)"
     else:
-        sign = "+" if pct >= 0 else ""
-        pct_str = f"{sign}{pct:.2f}%"
+        sign = "+" if pct_1d >= 0 else ""
+        date_str = str(the_date)
+        post_line = (
+            f"{args.index_key.upper()} 1d: A%={sign}{pct_1d:.2f}% "
+            f"(basis={basis} valid={date_str} first->latest)"
+        )
 
-    # テキスト
-    text = f"{index_key.upper()} 1d: A%={pct_str} (basis={basis} valid={valid})"
-    out_text.write_text(text + "\n", encoding="utf-8")
+    # 保存
+    Path(args.out_text).write_text(post_line + "\n", encoding="utf-8")
 
-    # JSON（サイト側の取り回し用）
-    out_json.write_text(json.dumps({
-        "index_key": index_key,
-        "pct_1d": None if pct is None else float(pct),
-        "delta_level": None,     # レベルは表示しない方針
+    stats_obj = {
+        "index_key": args.index_key,
+        "pct_1d": None if pct_1d is None else float(pct_1d),
+        "delta_level": None,         # レベル差はサイト側で使わないので固定
         "scale": "level",
         "basis": basis,
-        "updated_at": pd.Timestamp.utcnow().isoformat(timespec="seconds") + "Z",
-    }), encoding="utf-8")
+        "updated_at": pd.Timestamp.utcnow().isoformat() + "Z",
+    }
+    Path(args.out_json).write_text(json.dumps(stats_obj, ensure_ascii=False), encoding="utf-8")
+
 
 if __name__ == "__main__":
     main()
