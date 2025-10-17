@@ -3,19 +3,21 @@ name: Generate long-term charts (1d/7d/1m/1y + stats + intraday)
 on:
   workflow_dispatch:
   schedule:
-    # UTC（必要に応じて調整）
+    # 毎日 20:15 UTC（必要に応じて調整）
     - cron: "15 20 * * *"
 
 permissions:
   contents: write
 
+# 他WFとぶつからないよう強めにブロック
 concurrency:
-  group: long-charts-${{ github.ref }}
-  cancel-in-progress: false
+  group: ain10
+  cancel-in-progress: true
 
 env:
-  # このリポのインデックスキー
   INDEX_KEY: ain10
+  THEME: dark              # "dark" / "light"
+  # LINE_COLOR: "#ff6b6b"  # 必要なら上書き
 
 jobs:
   build:
@@ -46,17 +48,20 @@ jobs:
             pip install pandas numpy matplotlib
           fi
 
-      # 1d/7d/1m/1y のレベルチャート生成（CSVも出力）
+      # 画像/CSVだけを生成（post/statは触らない）
       - name: Generate long-term charts
         env:
           INDEX_KEY: ${{ env.INDEX_KEY }}
+          THEME: ${{ env.THEME }}
+          LINE_COLOR: ${{ env.LINE_COLOR }}
+          WRITE_PLACEHOLDER: "0"
         run: |
           set -e
           python scripts/long_charts.py
           echo "---- LIST AFTER CHARTS ----"
           ls -al docs/outputs || true
 
-      # intraday 価格CSVから 1日% を計算（レベルは常に N/A）
+      # 1日騰落率（open→latest）。post/stat はここだけが書く
       - name: Compute 1d percent & write posts
         env:
           INDEX_KEY: ${{ env.INDEX_KEY }}
@@ -64,11 +69,10 @@ jobs:
           set -e
           python scripts/ain10_pct_post.py \
             --index-key "${INDEX_KEY}" \
-            --csv "docs/outputs/${INDEX_KEY}_intraday.csv" \
-            --out-json "docs/outputs/${INDEX_KEY}_stats.json" \
-            --out-text "docs/outputs/${INDEX_KEY}_post_intraday.txt"
+            --csv       "docs/outputs/${INDEX_KEY}_1d.csv" \
+            --out-json  "docs/outputs/${INDEX_KEY}_stats.json" \
+            --out-text  "docs/outputs/${INDEX_KEY}_post_intraday.txt"
 
-      # デバッグ用に成果物を保存（任意）
       - name: Upload artifacts (for debug)
         if: always()
         uses: actions/upload-artifact@v4
@@ -76,27 +80,22 @@ jobs:
           name: outputs
           path: docs/outputs
 
-      # 生成物のコミット
       - name: Commit charts if changed
         run: |
           set -e
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          # 画像（1d/7d/1m/1y）
           git add docs/outputs/${{ env.INDEX_KEY }}_1d.png || true
           git add docs/outputs/${{ env.INDEX_KEY }}_7d.png || true
           git add docs/outputs/${{ env.INDEX_KEY }}_1m.png || true
           git add docs/outputs/${{ env.INDEX_KEY }}_1y.png || true
 
-          # CSV（存在すれば）
           git add docs/outputs/${{ env.INDEX_KEY }}_1d.csv || true
           git add docs/outputs/${{ env.INDEX_KEY }}_7d.csv || true
           git add docs/outputs/${{ env.INDEX_KEY }}_1m.csv || true
           git add docs/outputs/${{ env.INDEX_KEY }}_1y.csv || true
-          git add docs/outputs/${{ env.INDEX_KEY }}_intraday.csv || true
 
-          # 投稿テキスト・統計
           git add docs/outputs/${{ env.INDEX_KEY }}_post_intraday.txt || true
           git add docs/outputs/${{ env.INDEX_KEY }}_stats.json || true
 
