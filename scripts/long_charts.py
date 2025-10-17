@@ -1,116 +1,52 @@
 #!/usr/bin/env python3
-import os
-import json
-from datetime import datetime
 from pathlib import Path
-
-import numpy as np
 import pandas as pd
+import numpy as np
 import matplotlib.pyplot as plt
 
-# ---- 共通設定 ---------------------------------------------------------------
-OUT_DIR = Path("docs/outputs")
-DARK_BG = "#0d1117"   # GitHub ダークに馴染む黒
-FG      = "#e6edf3"   # 文字色
-GRID    = "#30363d"   # 罫線
-RED     = "#ff6b6b"   # 下落トーン（既定の AIN 系は赤で表示）
-GREEN   = "#31c48d"   # 上昇トーン
+OUT = Path("docs/outputs")
+OUT.mkdir(parents=True, exist_ok=True)
+INDEX_KEY = "ain10"
 
-plt.rcParams.update({
-    "figure.facecolor": DARK_BG,
-    "axes.facecolor": DARK_BG,
-    "savefig.facecolor": DARK_BG,
-    "text.color": FG,
-    "axes.labelcolor": FG,
-    "xtick.color": FG,
-    "ytick.color": FG,
-    "axes.grid": True,
-    "grid.color": GRID,
-    "grid.linestyle": "-",
-    "grid.linewidth": 0.6,
-})
+def _load(name):
+    p = OUT / f"{INDEX_KEY}_{name}.csv"
+    return pd.read_csv(p)
 
-# ---- CSV 読み込みユーティリティ --------------------------------------------
-def load_series(csv_path: Path) -> pd.DataFrame:
-    """
-    docs/outputs/*_{period}.csv を読み込み、時系列にソート。
-    列は以下のいずれかに対応:
-      - ["Datetime", "<INDEX_NAME>"]
-      - ["time", "value"] など
-    値列は「最初の数値列」を採用。
-    """
-    df = pd.read_csv(csv_path)
-    # 日時候補
-    for c in ["Datetime", "datetime", "timestamp", "time", "date"]:
-        if c in df.columns:
-            df[c] = pd.to_datetime(df[c])
-            df = df.sort_values(c).reset_index(drop=True)
-            df = df.rename(columns={c: "time"})
-            break
-    else:
-        raise ValueError(f"datetime column not found in {csv_path.name}")
+def _numeric_two_cols(df):
+    ts_col = df.columns[0]
+    val_col = df.columns[1]
+    df = df[[ts_col, val_col]].rename(columns={ts_col:"ts", val_col:"value"})
+    df["value"] = pd.to_numeric(df["value"], errors="coerce")
+    return df.dropna(subset=["value"])
 
-    # 値列は最初の数値列
-    num_cols = [c for c in df.columns if c != "time" and np.issubdtype(df[c].dtype, np.number)]
-    if not num_cols:
-        # 数値が1つもない場合は、「AIN-10」「AIN10」「value」等の文字列列を安全に変換
-        for c in ["AIN-10", "AIN10", "value", "score", "close", "price", "index"]:
-            if c in df.columns:
-                df[c] = pd.to_numeric(df[c], errors="coerce")
-                num_cols = [c]
-                break
-    if not num_cols:
-        raise ValueError(f"value column not found in {csv_path.name}")
+def _plot(df, title, png_name):
+    # ダーク & 赤線 & 枠線なし
+    fig, ax = plt.subplots(figsize=(12,6), dpi=140)
+    fig.patch.set_facecolor("#0c0f12")
+    ax.set_facecolor("#0c0f12")
+    ax.plot(df["ts"], df["value"], linewidth=2.2)  # 色はデフォ（後で赤）
+    for spine in ax.spines.values():
+        spine.set_visible(False)
+    ax.grid(True, alpha=0.25, linestyle="-")
+    ax.set_title(title, color="white", fontsize=20, pad=14)
+    ax.set_xlabel("Time", color="white")
+    ax.set_ylabel("Index (level)", color="white")
+    ax.tick_params(colors="white")
+    # 線色を赤に（切替システムがあってもここで固定）
+    ax.lines[0].set_color("#ff6b6b")
 
-    df = df.rename(columns={num_cols[0]: "value"})
-    return df[["time", "value"]]
-
-# ---- プロット ----------------------------------------------------------------
-def render_chart(period: str, index_key: str, color: str):
-    csv_path = OUT_DIR / f"{index_key}_{period}.csv"
-    if not csv_path.exists():
-        # CSV がない時はスキップ（ワークフロー上は no-op）
-        return
-
-    df = load_series(csv_path)
-    fig, ax = plt.subplots(figsize=(10.5, 5.2), dpi=140)
-
-    # 白い外枠を消す（spineを全消し）
-    for s in ax.spines.values():
-        s.set_visible(False)
-
-    ax.plot(df["time"], df["value"], color=color, linewidth=2.2)
-
-    ax.set_title(f"{index_key.upper()} ({period})", fontsize=16, pad=10, color=FG)
-    ax.set_xlabel("Time")
-    ax.set_ylabel("Index (level)")
-
-    # 余白を調整（白フチ防止）
-    plt.margins(x=0.02, y=0.08)
-    plt.tight_layout()
-
-    out_png = OUT_DIR / f"{index_key}_{period}.png"
-    fig.savefig(out_png, bbox_inches="tight", pad_inches=0.2)
+    fig.tight_layout()
+    fig.savefig(OUT / png_name, bbox_inches="tight", pad_inches=0)
     plt.close(fig)
 
+def save_csv(name, df):
+    df.to_csv(OUT / f"{INDEX_KEY}_{name}.csv", index=False)
+
 def main():
-    index_key = os.getenv("INDEX_KEY", "ain10")
-
-    # カラーモード（上昇/下落）切り替え：
-    # 直近1d の開始値と終了値でざっくり判定（デフォルトは赤）
-    color = RED
-    try:
-        d1 = load_series(OUT_DIR / f"{index_key}_1d.csv")
-        if len(d1) >= 2 and np.isfinite(d1["value"].iloc[0]) and np.isfinite(d1["value"].iloc[-1]):
-            color = GREEN if (d1["value"].iloc[-1] - d1["value"].iloc[0]) >= 0 else RED
-    except Exception:
-        pass
-
-    for period in ["1d", "7d", "1m", "1y"]:
-        try:
-            render_chart(period, index_key, color)
-        except Exception as e:
-            print(f"[WARN] render {period}: {e}")
+    # 既に生成済みの 1d/7d/1m/1y CSV がある前提（このリポのパイプライン仕様）
+    for span in ["1d", "7d", "1m", "1y"]:
+        df = _numeric_two_cols(_load(span))
+        _plot(df, f"{INDEX_KEY.upper()} ({span})", f"{INDEX_KEY}_{span}.png")
 
 if __name__ == "__main__":
     main()
