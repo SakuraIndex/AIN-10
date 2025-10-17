@@ -38,21 +38,18 @@ def find_nonzero_open(df: pd.DataFrame) -> tuple[Optional[float], str]:
     lower = t0 + pd.Timedelta(minutes=SAFE_WINDOW_MIN)
     upper = t0 + pd.Timedelta(minutes=MAX_WINDOW_MIN)
 
-    # 優先探索: 5〜30分の間で非ゼロ
     m = (df["ts"] >= lower) & (df["ts"] <= upper) & (df["val"].abs() >= EPS)
     if m.any():
         row = df[m].iloc[0]
         when = pd.to_datetime(row["ts"])
         return float(row["val"]), f"open(nonzero@{when.strftime('%H:%M')})"
 
-    # フォールバック: 全体で最初の非ゼロ
     m2 = (df["val"].abs() >= EPS)
     if m2.any():
         row = df[m2].iloc[0]
         when = pd.to_datetime(row["ts"])
         return float(row["val"]), f"open(first_nonzero@{when.strftime('%H:%M')})"
 
-    # すべてゼロ近傍
     return None, "open(all_zero)"
 
 def percent_change(first: float, last: float) -> Optional[float]:
@@ -74,8 +71,9 @@ def main():
     ap.add_argument("--csv", required=True, help="docs/outputs/*_1d.csv")
     ap.add_argument("--out-json", required=True)
     ap.add_argument("--out-text", required=True)
-    # basis は将来拡張用: 現在は "open" だけだが互換のため残す
     ap.add_argument("--basis", choices=["open", "prev_close"], default="open")
+    # ← 互換目的で受け取って無視する（ワークフローが渡しても落ちないように）
+    ap.add_argument("--history", required=False)
     args = ap.parse_args()
 
     df = read_1d(Path(args.csv))
@@ -91,15 +89,10 @@ def main():
         last_val  = float(last_row["val"])
         valid_note = f"{first_row['ts']}->{last_row['ts']}"
 
-        # 基準(分母)の決定
         base_val, base_note = find_nonzero_open(df)
-        basis_note = base_note
+        basis_note = base_note if args.basis == "open" else "prev_close"
 
-        # Δ（レベル差）はオープン直後(最初の行)との差で表示すると混乱するので、
-        # グラフの水準差としては “最初の行との差” を維持
         delta_level = last_val - float(first_row["val"])
-
-        # 騰落率は “最初の有効な非ゼロ基準” で計算
         pct_val = percent_change(base_val, last_val)
 
     # --- TXT 出力
