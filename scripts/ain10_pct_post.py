@@ -1,165 +1,134 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-"""
-1日騰落率(%)とレベル差を算出し、
-- docs/outputs/<index_key>_post_intraday.txt
-- docs/outputs/<index_key>_stats.json
-を更新する小ツール。
-
-特徴:
-- CSVのカラム名が固定でなくてもOK（先頭列=日時、2列目=値として解釈）
-- オープン値が0や極小で%が出せないときは、直近の非ゼロ値へ自動フォールバック
-- データが欠損・全ゼロの場合は A%=N/A として安全に終了
-"""
-
 import argparse
 import json
 from pathlib import Path
 from datetime import datetime, timezone
 
 import pandas as pd
-import numpy as np
 
 
-def _utcnow_iso() -> str:
+def now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def load_intraday_csv(csv_path: Path) -> pd.DataFrame:
-    """先頭列=時刻, 2列目=値 とみなして読み込む。"""
+def read_two_col_series(csv_path: Path) -> pd.DataFrame:
+    """先頭列=日時, 2列目=値 として読み込む（列名に依存しない）"""
     df = pd.read_csv(csv_path)
     if df.shape[1] < 2:
-        raise ValueError(f"CSV needs at least 2 columns: {csv_path}")
-    # 先頭列を時刻に、2列目を値に正規化
+        raise ValueError(f"CSV has insufficient columns: {csv_path}")
     ts_col = df.columns[0]
     val_col = df.columns[1]
-    out = pd.DataFrame({
+    df = pd.DataFrame({
         "ts": pd.to_datetime(df[ts_col], errors="coerce"),
-        "val": pd.to_numeric(df[val_col], errors="coerce")
-    }).dropna(subset=["ts"])
-    out = out.sort_values("ts").reset_index(drop=True)
-    return out
+        "val": pd.to_numeric(df[val_col], errors="coerce"),
+    }).dropna(subset=["ts", "val"]).sort_values("ts").reset_index(drop=True)
+    return df
 
 
-def first_non_nan(series: pd.Series) -> float | None:
-    """最初の非NaN値を返す。なければNone。"""
-    s = series.dropna()
-    return None if s.empty else float(s.iloc[0])
-
-
-def last_non_nan(series: pd.Series) -> float | None:
-    """最後の非NaN値を返す。なければNone。"""
-    s = series.dropna()
-    return None if s.empty else float(s.iloc[-1])
-
-
-def find_first_nonzero(series: pd.Series, scan: int = 20, eps: float = 1e-9) -> float | None:
-    """
-    先頭からscan件のうち、ゼロでない(絶対値>eps)最初の値を探す。
-    見つからなければNone。
-    """
-    s = series.dropna()
-    if s.empty:
+def safe_pct(numer: float, denom: float) -> float | None:
+    if denom is None or denom == 0:
         return None
-    head = s.iloc[:scan]
-    nz = head[head.abs() > eps]
-    return None if nz.empty else float(nz.iloc[0])
+    try:
+        return (numer / denom) * 100.0
+    except Exception:
+        return None
 
 
-def compute_change_and_pct(df: pd.DataFrame) -> tuple[float | None, float | None, str, str]:
+def compute_basis_value(basis: str, intraday_df: pd.DataFrame,
+                        history_path: Path | None) -> tuple[float | None, str]:
     """
-    Δlevel と pct(%) を計算。
-    戻り値: (delta_level, pct_1d, basis, valid_note)
-      - basis: "open" か "first_nonzero" か "n/a"
-      - valid_note: "first->latest" 等、簡易バリデーション文字列
+    basis を解決して基準値を返す。
+    - open: intraday の最初の有効値
+    - prev_close: history CSV（任意）から直近クローズ。無ければ None
+    - prev_any: 取りうる最も直近の値（intraday先頭でも可）
     """
-    if df.empty:
-        return None, None, "n/a", "n/a"
+    if intraday_df.empty:
+        return None, "n/a"
 
-    open_val = first_non_nan(df["val"])
-    last_val = last_non_nan(df["val"])
-    if open_val is None or last_val is None:
-        return None, None, "n/a", "n/a"
+    if basis == "open":
+        return float(intraday_df["val"].iloc[0]), "open"
 
-    delta = last_val - open_val
+    if basis == "prev_any":
+        return float(intraday_df["val"].iloc[0]), "prev_any"
 
-    # デフォルト: open基準
-    basis = "open"
-    base_val = open_val
+    if basis == "prev_close":
+        if history_path and Path(history_path).exists():
+            try:
+                h = read_two_col_series(Path(history_path))
+                if not h.empty:
+                    return float(h["val"].iloc[-1]), "prev_close"
+            except Exception:
+                pass
+        return None, "prev_close"  # 情報無しでも落とさない
 
-    # open==0（または極小）ならフォールバック
-    if base_val is None or abs(base_val) < 1e-9:
-        alt = find_first_nonzero(df["val"], scan=30, eps=1e-9)
-        if alt is not None:
-            basis = "first_nonzero"
-            base_val = alt
-        else:
-            # %は算出不能
-            return delta, None, "n/a", "first->latest"
-
-    pct = (last_val - base_val) / abs(base_val) * 100.0
-    return delta, pct, basis, "first->latest"
+    # 不明指定は open 扱い
+    return float(intraday_df["val"].iloc[0]), "open"
 
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--index-key", required=True, help="例: ain10 / astra4 / ...")
-    ap.add_argument("--csv", required=True, help="docs/outputs/<index>_1d.csv")
-    ap.add_argument("--out-json", required=True, help="docs/outputs/<index>_stats.json")
-    ap.add_argument("--out-text", required=True, help="docs/outputs/<index>_post_intraday.txt")
+    ap = argparse.ArgumentParser(description="Compute 1d percent & write posts")
+    ap.add_argument("--index-key", required=True, dest="index_key")
+    ap.add_argument("--csv", required=True, help="intraday 1d CSV path")
+    ap.add_argument("--out-json", required=True, dest="out_json")
+    ap.add_argument("--out-text", required=True, dest="out_text")
+    ap.add_argument("--basis", choices=["open", "prev_close", "prev_any"],
+                    default="open", help="percent basis (default: open)")
+    ap.add_argument("--history", default=None,
+                    help="optional history CSV (for prev_close)")
     args = ap.parse_args()
 
-    index_key = args.index_key.strip()
     csv_path = Path(args.csv)
-    out_json = Path(args.out_json)
-    out_text = Path(args.out_text)
+    df = read_two_col_series(csv_path)
+    updated_at = now_iso()
 
-    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    # デフォルト（計算不能時）
+    pct_1d = None
+    delta_level = None
+    valid_str = "n/a"
 
-    try:
-        df = load_intraday_csv(csv_path)
-    except Exception as e:
-        # 入力が壊れている等 → セーフにN/Aで吐いて終了
-        msg = f"{index_key.upper()} 1d: Δ=N/A (level) A%=N/A (basis=n/a valid=n/a)"
-        out_text.write_text(msg + "\n", encoding="utf-8")
-        payload = {
-            "index_key": index_key,
-            "pct_1d": None,
-            "delta_level": None,
-            "scale": "level",
-            "basis": "n/a",
-            "updated_at": _utcnow_iso(),
-        }
-        out_json.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
-        return
+    if not df.empty:
+        first_ts = df["ts"].iloc[0]
+        last_ts = df["ts"].iloc[-1]
+        last_val = float(df["val"].iloc[-1])
 
-    delta, pct, basis, valid_note = compute_change_and_pct(df)
+        basis_val, basis_used = compute_basis_value(args.basis, df,
+                                                    Path(args.history) if args.history else None)
+        if basis_val is not None:
+            delta_level = last_val - basis_val
+            pct_1d = safe_pct(delta_level, basis_val)
+            valid_str = f"{first_ts.strftime('%Y-%m-%d %H:%M')}->{last_ts.strftime('%Y-%m-%d %H:%M')}"
+        else:
+            basis_used = args.basis
+
+    # JSON 出力
+    out_json = {
+        "index_key": args.index_key,
+        "pct_1d": float(pct_1d) if pct_1d is not None else None,
+        "delta_level": float(delta_level) if delta_level is not None else None,
+        "scale": "level",
+        "basis": args.basis,
+        "updated_at": updated_at,
+    }
+    Path(args.out_json).parent.mkdir(parents=True, exist_ok=True)
+    with open(args.out_json, "w", encoding="utf-8") as f:
+        json.dump(out_json, f, ensure_ascii=False)
 
     # テキスト出力
-    if delta is None:
-        delta_str = "N/A"
-    else:
-        delta_str = f"{delta:.6f}".rstrip("0").rstrip(".")
+    def fmt_pct(p):
+        return f"{p:+.2f}%" if p is not None else "N/A"
 
-    if pct is None:
-        pct_str = "N/A"
-    else:
-        pct_str = f"{pct:+.2f}%"
+    def fmt_delta(d):
+        return f"{d:+.6f}" if d is not None else "N/A"
 
-    line = f"{index_key.upper()} 1d: Δ={delta_str} (level) A%={pct_str} (basis={basis} valid={valid_note})"
-    out_text.write_text(line + "\n", encoding="utf-8")
+    line = (f"{args.index_key.upper()} 1d: Δ={fmt_delta(delta_level)} (level) "
+            f"A%={fmt_pct(pct_1d)} (basis={args.basis} valid={valid_str})")
 
-    # JSON出力
-    payload = {
-        "index_key": index_key,
-        "pct_1d": None if pct is None else float(pct),
-        "delta_level": None if delta is None else float(delta),
-        "scale": "level",
-        "basis": basis if pct is not None else "n/a",
-        "updated_at": _utcnow_iso(),
-    }
-    out_json.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    with open(args.out_text, "w", encoding="utf-8") as f:
+        f.write(line + "\n")
+
+    print("[OK] wrote:", args.out_json, "and", args.out_text)
 
 
 if __name__ == "__main__":
