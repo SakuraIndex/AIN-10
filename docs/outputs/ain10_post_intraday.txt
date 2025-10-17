@@ -1,1 +1,1 @@
-AIN10 1d: Δ=-0.856514 (level)  Δ%=N/A (basis n/a valid=2025-10-16 09:30->2025-10-16 15:50)
+AIN10 1d: A%=N/A (basis n/a)
