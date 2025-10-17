@@ -8,7 +8,6 @@ on:
 permissions:
   contents: write
 
-# 同時実行の衝突を避ける（任意だが推奨）
 concurrency:
   group: long-charts-${{ github.ref }}
   cancel-in-progress: false
@@ -37,7 +36,9 @@ jobs:
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          if [ -f src/requirements.txt ]; then
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          elif [ -f src/requirements.txt ]; then
             pip install -r src/requirements.txt
           else
             pip install pandas numpy matplotlib
@@ -47,10 +48,22 @@ jobs:
         env:
           INDEX_KEY: ${{ env.INDEX_KEY }}
         run: |
-          set -e
-          python scripts/long_charts.py
+          set -euo pipefail
+
+          CSV_DIR="docs/outputs"
+          OUT_DIR="docs/outputs"
+          TITLE_PREFIX=$(printf "%s" "${INDEX_KEY}" | tr '[:lower:]' '[:upper:]')
+
+          echo "---- INPUT CSVs ----"
+          ls -al "${CSV_DIR}" || true
+
+          python scripts/long_charts.py --csv "${CSV_DIR}/${INDEX_KEY}_1d.csv" --out "${OUT_DIR}/${INDEX_KEY}_1d.png" --title "${TITLE_PREFIX} (1d)"
+          python scripts/long_charts.py --csv "${CSV_DIR}/${INDEX_KEY}_7d.csv" --out "${OUT_DIR}/${INDEX_KEY}_7d.png" --title "${TITLE_PREFIX} (7d)"
+          python scripts/long_charts.py --csv "${CSV_DIR}/${INDEX_KEY}_1m.csv" --out "${OUT_DIR}/${INDEX_KEY}_1m.png" --title "${TITLE_PREFIX} (1m)"
+          python scripts/long_charts.py --csv "${CSV_DIR}/${INDEX_KEY}_1y.csv" --out "${OUT_DIR}/${INDEX_KEY}_1y.png" --title "${TITLE_PREFIX} (1y)"
+
           echo "---- LIST AFTER ----"
-          ls -al docs/outputs || true
+          ls -al "${OUT_DIR}" || true
 
       - name: Upload artifacts (for debug)
         if: always()
