@@ -1,171 +1,193 @@
 # scripts/long_charts.py
+# -*- coding: utf-8 -*-
+"""
+AIN 系の長期チャート(1d/7d/1m/1y)を描画し PNG を出力するスクリプト。
+- 背景: 黒 (dark_background)
+- 線色: 上昇=赤, 下落=青, 横ばい=グレー
+- チャート上に%は出さない（タイトル等へも出さない）
+- stats.json は "pct_1d": null を維持、"delta_level" のみ記録、"basis": "n/a"
+- 引数なしで動作（環境変数 INDEX_KEY を使用）。ワークフローからそのまま呼び出せます。
+
+CSVの想定:
+  docs/outputs/{index_key}_1d.csv
+  docs/outputs/{index_key}_7d.csv
+  docs/outputs/{index_key}_1m.csv
+  docs/outputs/{index_key}_1y.csv
+
+列名は柔軟に解決する:
+  - 時刻列候補: ["ts", "time", "timestamp", "date", "Datetime", "datetime"]
+  - 値列候補: ["value", "level", index_key] もしくは「最初の数値列」
+"""
+
+from __future__ import annotations
+
 import os
 import json
 from datetime import datetime, timezone
-import pandas as pd
+from typing import Tuple, Optional
+
 import numpy as np
+import pandas as pd
 import matplotlib
-matplotlib.use("Agg")
+matplotlib.use("Agg")  # GUI不要環境
 import matplotlib.pyplot as plt
 
-# -----------------------------------------------------------------------------
-# Helpers
-# -----------------------------------------------------------------------------
-def guess_time_col(cols):
-    cands = ["ts", "time", "timestamp", "date", "datetime", "Datetime"]
-    for c in cands:
-        for col in cols:
-            if col.lower() == c.lower():
-                return col
-    # fallback: 最初の列を時間とみなす
-    return cols[0]
 
-def guess_value_col(df, index_key):
-    # index_key にマッチする列を優先
-    for col in df.columns:
-        if col.lower() == index_key.lower():
-            return col
-        if index_key.lower() in col.lower():
-            return col
-    # 数値列のうち、時間列以外の最初を使う
-    num_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
-    if not num_cols:
-        # もし型推定が効いていない場合、float 変換を試みる
-        for c in df.columns:
-            try:
-                df[c] = pd.to_numeric(df[c], errors="raise")
-                num_cols.append(c)
-            except Exception:
-                pass
-    return num_cols[0] if num_cols else df.columns[-1]
+OUTPUT_DIR = "docs/outputs"
+TIME_COL_CANDIDATES = ["ts", "time", "timestamp", "date", "Datetime", "datetime"]
+VALUE_COL_CANDIDATES = ["value", "level"]  # index_key は後で追加
+PNG_TITLE_FMT = "{index_key_upper} ({label})"
 
-def load_series(csv_path, index_key):
-    if not os.path.exists(csv_path):
-        raise FileNotFoundError(csv_path)
+SERIES = [
+    ("1d", "1d"),
+    ("7d", "7d"),
+    ("1m", "1m"),
+    ("1y", "1y"),
+]
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def pick_time_col(df: pd.DataFrame) -> str:
+    for c in TIME_COL_CANDIDATES:
+        if c in df.columns:
+            return c
+    # Fallback: 最も「時刻っぽい」列を選ぶ（型/名前で推測）
+    for c in df.columns:
+        if "time" in c.lower() or "date" in c.lower():
+            return c
+    # どうしても無い場合は先頭列
+    return df.columns[0]
+
+
+def pick_value_col(df: pd.DataFrame, index_key: str) -> str:
+    candidates = VALUE_COL_CANDIDATES + [index_key, index_key.upper(), index_key.replace("_", "-").upper()]
+    for c in candidates:
+        if c in df.columns:
+            return c
+    # 最初に見つかった「数値列」を返す
+    numeric_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
+    if numeric_cols:
+        return numeric_cols[0]
+    # どうしても見つからない場合は2列目を仮定
+    return df.columns[min(1, len(df.columns) - 1)]
+
+
+def load_series(csv_path: str, index_key: str) -> pd.DataFrame:
     df = pd.read_csv(csv_path)
+    tcol = pick_time_col(df)
+    vcol = pick_value_col(df, index_key)
+
+    # 時刻列を datetime 化
+    df["ts"] = pd.to_datetime(df[tcol], errors="coerce", utc=True)
+    # 値列を float 化
+    df["value"] = pd.to_numeric(df[vcol], errors="coerce")
+
+    # 欠損除去・並び替え
+    df = df.dropna(subset=["ts", "value"]).sort_values("ts").reset_index(drop=True)
     if df.empty:
-        raise ValueError(f"empty csv: {csv_path}")
-    tcol = guess_time_col(df.columns)
-    vcol = guess_value_col(df.drop(columns=[tcol], errors="ignore"), index_key)
-    # 時刻パース
-    try:
-        df[tcol] = pd.to_datetime(df[tcol])
-    except Exception:
-        # 数値 epoch の可能性
-        df[tcol] = pd.to_datetime(df[tcol], unit="s", errors="coerce")
-    df = df[[tcol, vcol]].dropna()
-    df = df.sort_values(tcol)
-    df = df.rename(columns={tcol: "ts", vcol: "value"})
-    return df
+        raise ValueError(f"{csv_path}: 有効データがありません (ts/value が空)")
 
-def to_utc_iso(dt=None):
-    if dt is None:
-        dt = datetime.now(timezone.utc)
-    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return df[["ts", "value"]]
 
-# -----------------------------------------------------------------------------
-# Rendering (dark theme, red line, no % on chart)
-# -----------------------------------------------------------------------------
-def render_level_chart(csv_path, png_path, title, index_key):
+
+def line_color_for_delta(delta_level: float) -> str:
+    if delta_level > 0:
+        return "#ff6b6b"  # 上昇=赤
+    if delta_level < 0:
+        return "#4da3ff"  # 下落=青
+    return "#aaaaaa"      # 横ばい=グレー
+
+
+def render_level_chart(csv_path: str, png_path: str, title: str, index_key: str) -> Tuple[float, Tuple[pd.Timestamp, pd.Timestamp]]:
     df = load_series(csv_path, index_key)
+
+    # Δ(level)
+    delta_level = float(np.round(df["value"].iloc[-1] - df["value"].iloc[0], 6))
+    color = line_color_for_delta(delta_level)
+
     plt.style.use("dark_background")
     fig, ax = plt.subplots(figsize=(12, 6), dpi=140)
-    ax.plot(df["ts"], df["value"], linewidth=2.0, color="#ff6b6b")  # 赤
+
+    ax.plot(df["ts"], df["value"], linewidth=2.2, color=color)
     ax.set_title(title, fontsize=16, pad=12)
     ax.set_xlabel("Time")
     ax.set_ylabel("Index (level)")
-    ax.grid(True, alpha=0.3)
+    ax.grid(True, alpha=0.28)
+
     fig.tight_layout()
     os.makedirs(os.path.dirname(png_path), exist_ok=True)
     fig.savefig(png_path)
     plt.close(fig)
-    # 当日レベル差（始値→終値）を返す
-    delta_level = float(np.round(df["value"].iloc[-1] - df["value"].iloc[0], 6))
-    # 有効期間（最初と最後）も返す
+
     valid = (df["ts"].iloc[0], df["ts"].iloc[-1])
     return delta_level, valid
 
-# -----------------------------------------------------------------------------
-# Stats writers
-# -----------------------------------------------------------------------------
-def write_post_intraday_txt(path, index_key, delta_level, valid):
-    start, end = valid
-    line = (
-        f"{index_key.upper()} 1d: Δ="
-        f"{'N/A' if delta_level is None else f'{delta_level:.6f}'} "
-        f"(level) A%=N/A (basis n/a valid="
-        f"{start.strftime('%Y-%m-%d %H:%M')}->{end.strftime('%Y-%m-%d %H:%M')})"
-    )
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(line + "\n")
 
-def compute_pct_1d_close(history_csv, index_key):
+def write_stats_json(index_key: str, delta_level: Optional[float]) -> None:
     """
-    history_csv から終値の直近2点を取り、前日比(%)を算出。
-    列名は自動検出。prev == 0 の場合は None を返す。
+    グローバルな stats JSON を書き出し。
+    - pct_1d は常に null（レベルでは%表示しない）
+    - delta_level は直近 1d の Δ(level)。計算できない/未生成なら null。
+    - basis は "n/a"
     """
-    if not os.path.exists(history_csv):
-        return None
-    h = pd.read_csv(history_csv)
-    if h.empty or len(h) < 2:
-        return None
-    tcol = guess_time_col(h.columns)
-    vcol = guess_value_col(h.drop(columns=[tcol], errors="ignore"), index_key)
-    # 日次想定：最後の2点
-    try:
-        h[tcol] = pd.to_datetime(h[tcol])
-    except Exception:
-        pass
-    h = h.sort_values(tcol)
-    last = pd.to_numeric(h[vcol].iloc[-1], errors="coerce")
-    prev = pd.to_numeric(h[vcol].iloc[-2], errors="coerce")
-    if pd.isna(last) or pd.isna(prev) or prev == 0:
-        return None
-    pct = float((last - prev) / abs(prev) * 100.0)
-    return round(pct, 4)
-
-def write_stats_json(path, index_key, delta_level, pct_1d_close):
-    payload = {
+    out = {
         "index_key": index_key,
-        "pct_1d": None,               # レベル基準の%は常にN/Aポリシー
-        "pct_1d_close": pct_1d_close, # X投稿向け（前日終値比, %）
-        "delta_level": delta_level,   # 当日始値→終値のレベル差
+        "pct_1d": None,
+        "delta_level": (float(delta_level) if delta_level is not None else None),
         "scale": "level",
         "basis": "n/a",
-        "updated_at": to_utc_iso(),
+        "updated_at": _utc_now_iso(),
     }
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False)
+    out_path = os.path.join(OUTPUT_DIR, f"{index_key}_stats.json")
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(out, f, ensure_ascii=False)
+    print(f"[stats] wrote: {out_path}")
 
-# -----------------------------------------------------------------------------
-# Main
-# -----------------------------------------------------------------------------
-def main():
-    index_key = os.environ.get("INDEX_KEY", "ain10")
-    out_dir = os.path.join("docs", "outputs")
 
-    # 入力 CSV
-    csv_1d = os.path.join(out_dir, f"{index_key}_1d.csv")
-    history_csv = os.path.join(out_dir, f"{index_key}_history.csv")
+def write_post_marker(index_key: str) -> None:
+    """
+    X 投稿などで拾うプレーンテキスト（レベルでは%を出さない）。
+    """
+    text = f"{index_key.upper()} 1d: A%=N/A (basis n/a)"
+    out_path = os.path.join(OUTPUT_DIR, f"{index_key}_post_intraday.txt")
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write(text + "\n")
+    print(f"[post] wrote: {out_path} -> {text}")
 
-    # 出力
-    png_1d = os.path.join(out_dir, f"{index_key}_1d.png")
-    post_intraday_txt = os.path.join(out_dir, f"{index_key}_post_intraday.txt")
-    stats_json = os.path.join(out_dir, f"{index_key}_stats.json")
 
-    # 1d チャート（黒背景・赤線・%非表示）
-    delta_level, valid = render_level_chart(
-        csv_1d, png_1d, title=f"{index_key.upper()} (1d)", index_key=index_key
-    )
+def main() -> None:
+    index_key = os.environ.get("INDEX_KEY", "").strip().lower()
+    if not index_key:
+        raise SystemExit("環境変数 INDEX_KEY が未設定です")
 
-    # X 投稿用の「前日終値比 %」
-    pct_1d_close = compute_pct_1d_close(history_csv, index_key)
+    # 各期間の CSV と PNG
+    # 見つかったものだけ描画（無ければスキップ）
+    last_delta_1d: Optional[float] = None
 
-    # テキストと JSON
-    write_post_intraday_txt(post_intraday_txt, index_key, delta_level, valid)
-    write_stats_json(stats_json, index_key, delta_level, pct_1d_close)
+    for label, suffix in SERIES:
+        csv_path = os.path.join(OUTPUT_DIR, f"{index_key}_{suffix}.csv")
+        png_path = os.path.join(OUTPUT_DIR, f"{index_key}_{suffix}.png")
+
+        if not os.path.exists(csv_path):
+            print(f"[skip] CSV not found: {csv_path}")
+            continue
+
+        title = PNG_TITLE_FMT.format(index_key_upper=index_key.upper(), label=label)
+        try:
+            delta_level, valid = render_level_chart(csv_path, png_path, title, index_key)
+            print(f"[ok] {suffix} -> Δ(level)={delta_level:.6f} valid={valid[0]}->{valid[1]}")
+            if suffix == "1d":
+                last_delta_1d = delta_level
+        except Exception as e:
+            print(f"[error] render {suffix}: {e}")
+
+    # マーカー類の出力（%はN/Aの方針）
+    write_stats_json(index_key, last_delta_1d)
+    write_post_marker(index_key)
+
 
 if __name__ == "__main__":
     main()
