@@ -3,7 +3,7 @@ name: Generate long-term charts (1d/7d/1m/1y + stats + intraday)
 on:
   workflow_dispatch:
   schedule:
-    - cron: "15 20 * * *"   # UTC
+    - cron: "15 20 * * *" # UTC
 
 permissions:
   contents: write
@@ -41,17 +41,20 @@ jobs:
           elif [ -f src/requirements.txt ]; then
             pip install -r src/requirements.txt
           else
-            pip install pandas numpy matplotlib
+            pip install pandas numpy matplotlib pytz tzdata
           fi
 
+      # 1) チャート生成（黒背景 / 白枠なし）
       - name: Generate long-term charts
         env:
           INDEX_KEY: ${{ env.INDEX_KEY }}
         run: |
           set -e
           python scripts/long_charts.py
+          echo "---- LIST AFTER CHARTS ----"
           ls -al docs/outputs || true
 
+      # 2) 1d騰落率（当日 open→latest）を算出して stats.json / post_intraday.txt を更新
       - name: Compute 1d percent & write posts
         env:
           INDEX_KEY: ${{ env.INDEX_KEY }}
@@ -61,10 +64,8 @@ jobs:
             --index-key "${INDEX_KEY}" \
             --csv "docs/outputs/${INDEX_KEY}_1d.csv" \
             --out-json "docs/outputs/${INDEX_KEY}_stats.json" \
-            --out-text "docs/outputs/${INDEX_KEY}_post_intraday.txt"
-          echo "---- stat/post preview ----"
-          tail -n +1 docs/outputs/${INDEX_KEY}_stats.json || true
-          tail -n +1 docs/outputs/${INDEX_KEY}_post_intraday.txt || true
+            --out-text "docs/outputs/${INDEX_KEY}_post_intraday.txt" \
+            --session "09:30-15:50"
 
       - name: Upload artifacts (for debug)
         if: always()
@@ -79,18 +80,21 @@ jobs:
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
+          # 画像
           git add docs/outputs/${{ env.INDEX_KEY }}_1d.png || true
           git add docs/outputs/${{ env.INDEX_KEY }}_7d.png || true
           git add docs/outputs/${{ env.INDEX_KEY }}_1m.png || true
           git add docs/outputs/${{ env.INDEX_KEY }}_1y.png || true
 
+          # CSV
           git add docs/outputs/${{ env.INDEX_KEY }}_1d.csv || true
           git add docs/outputs/${{ env.INDEX_KEY }}_7d.csv || true
           git add docs/outputs/${{ env.INDEX_KEY }}_1m.csv || true
           git add docs/outputs/${{ env.INDEX_KEY }}_1y.csv || true
 
-          git add docs/outputs/${{ env.INDEX_KEY }}_stats.json || true
+          # 投稿テキスト・統計
           git add docs/outputs/${{ env.INDEX_KEY }}_post_intraday.txt || true
+          git add docs/outputs/${{ env.INDEX_KEY }}_stats.json || true
 
           if git diff --cached --quiet; then
             echo "No chart/stat updates."
