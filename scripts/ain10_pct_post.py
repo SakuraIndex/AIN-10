@@ -1,134 +1,119 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+"""
+1日騰落率（open -> latest）だけを計算して、
+- docs/outputs/<index>_post_intraday.txt
+- docs/outputs/<index>_stats.json
+を“唯一のスクリプト”として上書きする。
+"""
+
+from __future__ import annotations
+
 import argparse
 import json
-from datetime import timezone
 from pathlib import Path
+from datetime import datetime, time, timezone
 
-import numpy as np
 import pandas as pd
 
 
-def find_datetime_col(df: pd.DataFrame) -> str:
-    # 先頭候補を強めに推す
+def detect_cols(df: pd.DataFrame) -> tuple[str, str]:
+    lower = {c: c.lower() for c in df.columns}
+    t_candidates = ["datetime", "time", "timestamp", "date", "dt"]
+    v_candidates = ["value", "y", "index", "score", "close", "price"]
+
+    # AIN-10 列名等の特殊ケース（ハイフン除去で判定）
     for c in df.columns:
-        lc = c.lower()
-        if lc in ("datetime", "timestamp", "ts", "time", "date"):
-            return c
-    # 見つからなければ1列目を日時として解釈
-    return df.columns[0]
+        if lower[c].replace("-", "") in ("ain10", "ain"):
+            v_candidates.insert(0, c)
 
-
-def find_value_col(df: pd.DataFrame) -> str:
-    # 価格(終値/ラスト)候補
-    prefs = ["close", "last", "price", "value", "val"]
-    for p in prefs:
+    tcol = None
+    for k in t_candidates:
         for c in df.columns:
-            if p in c.lower():
-                return c
-    # だめなら2列目(1列目は日時のはず)
-    return df.columns[1]
+            if lower[c] == k:
+                tcol = c
+                break
+        if tcol:
+            break
+    if tcol is None:
+        tcol = df.columns[0]
+
+    vcol = None
+    for k in v_candidates:
+        for c in df.columns:
+            if lower[c] == k or c == k:
+                vcol = c
+                break
+        if vcol:
+            break
+    if vcol is None:
+        vcol = df.columns[1] if len(df.columns) > 1 else df.columns[0]
+
+    return tcol, vcol
 
 
-def find_open_col(df: pd.DataFrame) -> str | None:
-    for c in df.columns:
-        if "open" in c.lower():
-            return c
-    return None
+def pick_session_open_last(df: pd.DataFrame) -> tuple[float | None, float | None, str, str]:
+    tcol, vcol = detect_cols(df)
+    x = df[[tcol, vcol]].dropna().copy()
+    x[tcol] = pd.to_datetime(x[tcol], errors="coerce", utc=False)
+    x[vcol] = pd.to_numeric(x[vcol], errors="coerce")
+    x = x.dropna().sort_values(by=tcol)
 
+    # 市場時間（必要に応じて調整）
+    start_t, end_t = time(9, 30), time(15, 50)
+    sx = x[(x[tcol].dt.time >= start_t) & (x[tcol].dt.time <= end_t)]
+    if sx.empty:
+        return None, None, "n/a", "n/a"
 
-def pct_from_intraday_open_latest(df: pd.DataFrame) -> tuple[float | None, dict]:
-    """
-    同一営業日の 'open' → 'latest' で % を計算する。
-    戻り値: (pct_1d, meta)
-    meta = {"basis": "open", "valid": "YYYY-MM-DD open -> latest"}
-    """
-    # 日時
-    tcol = find_datetime_col(df)
-    df = df.copy()
-    df[tcol] = pd.to_datetime(df[tcol], utc=False, errors="coerce")
-    df = df.dropna(subset=[tcol])
-    if df.empty:
-        return None, {"basis": "n/a", "valid": "n/a"}
-
-    # 直近営業日のデータだけに絞る
-    last_day = df[tcol].dt.date.max()
-    day_df = df[df[tcol].dt.date == last_day].copy()
-    if day_df.empty:
-        return None, {"basis": "n/a", "valid": "n/a"}
-
-    vcol = find_value_col(day_df)
-    ocol = find_open_col(day_df)
-
-    # open 値
-    if ocol and ocol in day_df.columns:
-        open_val = day_df[ocol].dropna().iloc[0] if day_df[ocol].notna().any() else None
-    else:
-        # open列が無ければ、その日の最初の価格を open とみなす
-        open_val = day_df[vcol].dropna().iloc[0] if day_df[vcol].notna().any() else None
-
-    # latest 値
-    latest_val = day_df[vcol].dropna().iloc[-1] if day_df[vcol].notna().any() else None
-
-    if open_val is None or latest_val is None:
-        return None, {"basis": "n/a", "valid": "n/a"}
-
-    # 価格系列を想定(>0)。0/負値なら安全側で N/A
-    if not np.isfinite(open_val) or not np.isfinite(latest_val) or open_val <= 0:
-        return None, {"basis": "n/a", "valid": "n/a"}
-
-    pct = (latest_val / open_val - 1.0) * 100.0
-    meta = {
-        "basis": "open",
-        "valid": f"{last_day} open -> latest",
-    }
-    return float(pct), meta
+    first_ts = sx.iloc[0][tcol]
+    last_ts = sx.iloc[-1][tcol]
+    first = float(sx.iloc[0][vcol])
+    last = float(sx.iloc[-1][vcol])
+    return first, last, str(first_ts), str(last_ts)
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Compute 1d % for X post from intraday price CSV.")
+    ap = argparse.ArgumentParser()
     ap.add_argument("--index-key", required=True)
-    ap.add_argument(
-        "--csv",
-        required=True,
-        help="intraday price CSV (must contain datetime + price columns; open column optional)",
-    )
-    ap.add_argument("--out-json", required=True, help="path to stats json")
-    ap.add_argument("--out-text", required=True, help="path to post text")
+    ap.add_argument("--csv", required=True)
+    ap.add_argument("--out-json", required=True)
+    ap.add_argument("--out-text", required=True)
     args = ap.parse_args()
 
-    csv_path = Path(args.csv)
-    if not csv_path.exists():
-        raise FileNotFoundError(csv_path)
+    out_json_path = Path(args.out_json)
+    out_text_path = Path(args.out_text)
+    out_json_path.parent.mkdir(parents=True, exist_ok=True)
+    out_text_path.parent.mkdir(parents=True, exist_ok=True)
 
-    df = pd.read_csv(csv_path)
-
-    pct_1d, meta = pct_from_intraday_open_latest(df)
-
-    # JSON (サイト向けマーカー)
-    out = {
+    # 既定の（N/A）テンプレ
+    now_iso = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    post_line = f"{args.index_key.upper()} 1d: A%=N/A (basis=n/a valid=n/a)"
+    stats = {
         "index_key": args.index_key,
-        "pct_1d": None if pct_1d is None else float(pct_1d),
-        "delta_level": None,     # レベルは%にしない方針
+        "pct_1d": None,
+        "delta_level": None,
         "scale": "level",
-        "basis": meta.get("basis", "n/a"),
-        "updated_at": pd.Timestamp.utcnow().replace(tzinfo=timezone.utc).isoformat().replace("+00:00", "Z"),
+        "basis": "n/a",
+        "updated_at": now_iso,
     }
-    Path(args.out_json).write_text(json.dumps(out, ensure_ascii=False))
 
-    # X 投稿テキスト
-    if pct_1d is None:
-        a_pct = "N/A"
-    else:
-        a_pct = f"{pct_1d:+.2f}%"
+    try:
+        df = pd.read_csv(args.csv)
+        if not df.empty:
+            o, l, fts, lts = pick_session_open_last(df)
+            if o is not None and l is not None and o != 0.0:
+                pct = (l - o) / o * 100.0
+                post_line = f"{args.index_key.upper()} 1d: A%={pct:+.2f}% (basis=open valid={fts} -> {lts})"
+                stats.update({"pct_1d": pct, "basis": "open"})
+    except Exception as e:
+        # 何があっても出力は必ず残す（N/Aでもよい）
+        print(f"[warn] percent calc failed: {e}")
 
-    line = (
-        f"{args.index_key.upper()} 1d: Δ=N/A (level) "
-        f"A%={a_pct} (basis={meta.get('basis','n/a')} valid={meta.get('valid','n/a')})"
-    )
-    Path(args.out_text).write_text(line + "\n")
-
+    # 上書き出力
+    out_text_path.write_text(post_line + "\n", encoding="utf-8")
+    out_json_path.write_text(json.dumps(stats), encoding="utf-8")
+    print("[ok] post & stats written")
 
 if __name__ == "__main__":
     main()
