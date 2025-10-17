@@ -2,20 +2,22 @@
 # -*- coding: utf-8 -*-
 """
 AIN-10 charts + stats
-- ダークテーマ
-- 1d/7d/1m/1y のPNGを出力
-- 1日騰落「レベル差(Δ)」と「％(Δ%)」を併記して出力
-- ゼロ割/異常値は安全に N/A フォールバック
+- dark theme
+- dynamic line color
+- level と % の併記（%は安全ガード付き）
 """
 from pathlib import Path
 from datetime import datetime, timezone
 import json
+import math
+
 import pandas as pd
+import numpy as np
 import matplotlib.pyplot as plt
 
-# ----------------------------------
+# ------------------------
 # constants / paths
-# ----------------------------------
+# ------------------------
 INDEX_KEY = "ain10"
 OUTDIR = Path("docs/outputs")
 OUTDIR.mkdir(parents=True, exist_ok=True)
@@ -23,18 +25,18 @@ OUTDIR.mkdir(parents=True, exist_ok=True)
 HISTORY_CSV  = OUTDIR / f"{INDEX_KEY}_history.csv"
 INTRADAY_CSV = OUTDIR / f"{INDEX_KEY}_intraday.csv"
 
-# ----------------------------------
+# ------------------------
 # plotting style (dark)
-# ----------------------------------
-DARK_BG = "#0e0f13"  # whole figure
-DARK_AX = "#0b0c10"  # axes patch
+# ------------------------
+DARK_BG = "#0e0f13"
+DARK_AX = "#0b0c10"
 FG_TEXT = "#e7ecf1"
 GRID    = "#2a2e3a"
 RED     = "#ff6b6b"
 GREEN   = "#28e07c"
-FLAT    = "#9aa3af"
+FLAT    = "#9aa3af"  # ゼロ近傍・判定不能のとき
 
-def _apply_dark(ax, title: str) -> None:
+def _apply(ax, title: str) -> None:
     fig = ax.figure
     fig.set_size_inches(12, 7)
     fig.set_dpi(160)
@@ -49,52 +51,31 @@ def _apply_dark(ax, title: str) -> None:
     ax.set_xlabel("Time", color=FG_TEXT, fontsize=10)
     ax.set_ylabel("Index (level)", color=FG_TEXT, fontsize=10)
 
-def _trend_color(first: float | None, last: float | None) -> str:
-    if first is None or last is None:
+def _trend_color(series: pd.Series) -> str:
+    s = pd.to_numeric(series, errors="coerce").dropna()
+    if len(s) < 2:
         return FLAT
-    delta = last - first
+    delta = s.iloc[-1] - s.iloc[0]
     if delta > 0:
         return GREEN
     if delta < 0:
         return RED
     return FLAT
 
-def _save_line(df: pd.DataFrame, col: str, out_png: Path, title: str,
-               first_for_color: float | None = None) -> None:
+def _save(df: pd.DataFrame, col: str, out_png: Path, title: str) -> None:
     fig, ax = plt.subplots()
-    _apply_dark(ax, title)
-    last_val = pd.to_numeric(df[col], errors="coerce").dropna()
-    if last_val.empty:
-        # 何も描けない場合でも空画像を保存(更新トリガにする)
-        fig.savefig(out_png, bbox_inches="tight", facecolor=fig.get_facecolor())
-        plt.close(fig)
-        return
-    color = _trend_color(first_for_color, last_val.iloc[-1])
-    ax.plot(df.index, df[col], color=color, linewidth=1.6)
+    _apply(ax, title)
+    ax.plot(df.index, df[col], color=_trend_color(df[col]), linewidth=1.6)
     fig.savefig(out_png, bbox_inches="tight", facecolor=fig.get_facecolor())
     plt.close(fig)
 
-# ----------------------------------
-# data loading
-# ----------------------------------
-def _pick_index_column(df: pd.DataFrame) -> str:
-    """
-    AIN-10の本体列を推定。候補が無ければ最後の列を使う。
-    """
-    def norm(s: str) -> str:
-        return s.strip().lower().replace("_", "").replace("-", "")
-    candidates = {
-        "ain10", "ainindex", "ain10index", "ain10level", "ain_10", "ain"
-    }
-    ncols = {c: norm(c) for c in df.columns}
-    for c, nc in ncols.items():
-        if nc in candidates:
-            return c
-    return df.columns[-1]
-
+# ------------------------
+# data loading helpers
+# ------------------------
 def _load_df() -> pd.DataFrame:
     """
-    intraday があれば優先。先頭列を DatetimeIndex、数値列は to_numeric。
+    intraday があれば intraday 優先、無ければ history。
+    先頭列を DatetimeIndex に、数値列へ強制変換して NA を除去。
     """
     if INTRADAY_CSV.exists():
         df = pd.read_csv(INTRADAY_CSV, parse_dates=[0], index_col=0)
@@ -104,113 +85,119 @@ def _load_df() -> pd.DataFrame:
         raise FileNotFoundError("AIN-10: neither intraday nor history csv found.")
     for c in list(df.columns):
         df[c] = pd.to_numeric(df[c], errors="coerce")
-    return df.dropna(how="all")
+    df = df.dropna(how="all")
+    return df
 
-# ----------------------------------
-# intraday % logic (level → ratio)
-# ----------------------------------
-def _first_valid_for_ratio(s: pd.Series) -> float | None:
-    """
-    ％計算の分母に使う「最初の有効値」を選ぶ。
-    きわめて小さい値(≈0)はゼロ割・暴騰表記を招くので除外。
-    """
-    s = pd.to_numeric(s, errors="coerce").dropna()
-    for v in s:
-        if abs(v) >= 1e-9:  # 閾値は必要に応じ調整
-            return float(v)
-    return None
+def _pick_index_column(df: pd.DataFrame) -> str:
+    # 既存Ain-10は末尾列が本体想定
+    return df.columns[-1]
 
-def _last_valid(s: pd.Series) -> float | None:
-    s = pd.to_numeric(s, errors="coerce").dropna()
-    if s.empty:
-        return None
-    return float(s.iloc[-1])
-
-def _calc_intraday_change(level_series: pd.Series) -> tuple[float | None, float | None, float | None]:
+# ------------------------
+# % 計算（安全ガード）
+# ------------------------
+def _safe_pct_from_level(first: float, last: float, series: pd.Series) -> float | None:
     """
-    戻り値: (first, last, pct)
-      - first/last: その日の最初/最後のレベル（有効）
-      - pct: (last/first - 1) * 100（firstが極小/0なら None）
+    (last/first - 1) * 100 を基本としつつ、以下をガード:
+      - first が 0 またはニアゼロ
+      - first に対して last が極端（スパイク）で、相対値が不自然
+    不適切なら None を返す（表示は N/A に）。
     """
-    first = _first_valid_for_ratio(level_series)
-    last  = _last_valid(level_series)
     if first is None or last is None:
-        return first, last, None
-    try:
-        pct = (last / first - 1.0) * 100.0
-    except ZeroDivisionError:
-        pct = None
-    return first, last, pct
+        return None
+    if not (math.isfinite(first) and math.isfinite(last)):
+        return None
 
-# ----------------------------------
-# charts + stats
-# ----------------------------------
-def gen_pngs_and_stats() -> dict:
+    # ニアゼロ判定: 絶対値が 1e-6 未満、または系列の中央値に対して 2% 未満
+    med = float(np.nanmedian(np.abs(pd.to_numeric(series, errors="coerce").values)))
+    near_zero_threshold = max(1e-6, 0.02 * med) if math.isfinite(med) and med > 0 else 1e-6
+    if abs(first) < near_zero_threshold:
+        return None
+
+    pct = (last / first - 1.0) * 100.0
+
+    # 極端値ガード（±100%を大幅に超える場合はデータ異常の可能性が高い）
+    if abs(pct) > 100.0:
+        return None
+    return float(pct)
+
+# ------------------------
+# chart generation
+# ------------------------
+def gen_pngs() -> None:
     df = _load_df()
+    if df.empty:
+        return
     col = _pick_index_column(df)
 
-    # -- 1dウィンドウ: 直近(=intraday)を広めに確保
     tail_1d = df.tail(1000)
-    # 方向色判定用に first/last を計算
-    first, last, pct = _calc_intraday_change(tail_1d[col])
+    tail_7d = df.tail(7 * 1000)
 
-    # 画像
-    _save_line(tail_1d, col, OUTDIR / f"{INDEX_KEY}_1d.png",
-               f"{INDEX_KEY.upper()} (1d level)", first_for_color=first)
-    _save_line(df.tail(7 * 1000), col, OUTDIR / f"{INDEX_KEY}_7d.png",
-               f"{INDEX_KEY.upper()} (7d level)", first_for_color=None)
-    _save_line(df, col, OUTDIR / f"{INDEX_KEY}_1m.png",
-               f"{INDEX_KEY.upper()} (1m level)", first_for_color=None)
-    _save_line(df, col, OUTDIR / f"{INDEX_KEY}_1y.png",
-               f"{INDEX_KEY.upper()} (1y level)", first_for_color=None)
+    _save(tail_1d, col, OUTDIR / f"{INDEX_KEY}_1d.png", f"{INDEX_KEY.upper()} (1d level)")
+    _save(tail_7d, col, OUTDIR / f"{INDEX_KEY}_7d.png", f"{INDEX_KEY.upper()} (7d level)")
+    _save(df,      col, OUTDIR / f"{INDEX_KEY}_1m.png", f"{INDEX_KEY.upper()} (1m level)")
+    _save(df,      col, OUTDIR / f"{INDEX_KEY}_1y.png", f"{INDEX_KEY.upper()} (1y level)")
 
-    # 統計JSON（サイト読み取り用）
+# ------------------------
+# stats (level + pct) + marker
+# ------------------------
+def _now_utc_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+def write_stats_and_marker() -> None:
+    """
+    AIN-10 は level 系の指数。
+    - delta_level: 最後の level - 最初の level（1d ウィンドウ）
+    - pct_1d: (last/first - 1)*100（安全ガードで無理筋なら None）
+    """
+    df = _load_df()
+    if df.empty:
+        return
+    col = _pick_index_column(df)
+
+    # 1dウィンドウ（最大1000点）で first/last を取る
+    w = df.tail(1000)[col].dropna()
+    first_valid_ts = None
+    last_valid_ts  = None
+
+    if not w.empty:
+        first_valid_ts = w.index[0].isoformat()
+        last_valid_ts  = w.index[-1].isoformat()
+
+    # level差分
+    delta_level = None
+    pct = None
+    if len(w) >= 2:
+        first = float(w.iloc[0])
+        last  = float(w.iloc[-1])
+        delta_level = last - first
+        pct = _safe_pct_from_level(first, last, w)
+
     payload = {
         "index_key": INDEX_KEY,
-        # pct_1d は ％。None の場合は JSON では null になる
-        "pct_1d": None if pct is None else round(float(pct), 6),
-        # 表示用の「レベル差」（便利値）
-        "delta_level": None if (first is None or last is None) else round(float(last - first), 6),
+        "pct_1d": None if pct is None else round(pct, 6),
+        "delta_level": None if delta_level is None else round(delta_level, 6),
         "scale": "level",
-        "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+        "updated_at": _now_utc_iso(),
     }
     (OUTDIR / f"{INDEX_KEY}_stats.json").write_text(
         json.dumps(payload, ensure_ascii=False), encoding="utf-8"
     )
 
-    return {
-        "first": first, "last": last, "pct": pct
-    }
-
-def write_marker(first: float | None, last: float | None, pct: float | None) -> None:
-    """
-    投稿テキスト（人間向け）の整形: Δ(=レベル差) と Δ%(=％表記) を併記。
-    """
-    basis = "first-row valid"
-    if first is not None and last is not None:
-        delta = last - first
-        delta_str = f"{delta:+.6f}"
+    # human-friendly marker
+    marker = OUTDIR / f"{INDEX_KEY}_post_intraday.txt"
+    if delta_level is None:
+        marker.write_text(f"{INDEX_KEY.upper()} 1d: Δ=N/A (level)  Δ%=N/A\n", encoding="utf-8")
     else:
-        delta_str = "N/A"
+        pct_str = "N/A" if pct is None else f"{pct:+.2f}%"
+        marker.write_text(
+            f"{INDEX_KEY.upper()} 1d: Δ={delta_level:+.6f} (level)  Δ%={pct_str} "
+            f"(basis first-row valid={first_valid_ts}->{last_valid_ts})\n",
+            encoding="utf-8",
+        )
 
-    pct_str = "N/A" if pct is None else f"{pct:+.2f}%"
-
-    # 時間範囲（可読補助）
-    valid_range = ""
-    try:
-        df = _load_df()
-        t0 = df.index.min().isoformat()
-        t1 = df.index.max().isoformat()
-        valid_range = f" (basis {basis} valid={t0}->{t1})"
-    except Exception:
-        pass
-
-    text = f"{INDEX_KEY.upper()} 1d: Δ={delta_str} (level)  Δ%={pct_str}{valid_range}\n"
-    (OUTDIR / f"{INDEX_KEY}_post_intraday.txt").write_text(text, encoding="utf-8")
-
-# ----------------------------------
+# ------------------------
 # main
-# ----------------------------------
+# ------------------------
 if __name__ == "__main__":
-    res = gen_pngs_and_stats()
-    write_marker(res["first"], res["last"], res["pct"])
+    gen_pngs()
+    write_stats_and_marker()
