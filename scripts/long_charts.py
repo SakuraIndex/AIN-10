@@ -1,88 +1,126 @@
-# scripts/long_charts.py
-from __future__ import annotations
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-import matplotlib.dates as mdates
-import pandas as pd
-from pathlib import Path
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+docs/outputs/* の 1d/7d/1m/1y CSV を読み、黒ベースの画像(PNG)を出力します。
+- 背景: 濃いダーク (#0e0f12)
+- グリッド: さりげないグレー (#2a2d34, alpha 0.28)
+- 線: インデックス用の赤 (#ff6b6b) 1.8pt
+- 余白の白フチが出ないよう savefig(facecolor=fig.get_facecolor(), bbox_inches="tight")
+"""
+
 import os
+import sys
+import math
+from datetime import timezone
+import pandas as pd
+import numpy as np
+import matplotlib
+import matplotlib.pyplot as plt
+from matplotlib.dates import DateFormatter, AutoDateLocator
 
-TIME_CANDIDATES = ["ts","time","timestamp","date","datetime","Datetime"]
+INDEX_KEY = os.environ.get("INDEX_KEY", "ain10").lower()
+OUT_DIR = "docs/outputs"
 
-DARK_BG   = "#0b0f14"
-AX_BG     = "#0b0f14"
-GRID_COL  = "#9aa4b126"  # 薄い
-EDGE_COL  = "#222831"
-TICK_COL  = "#e6e6e6"
-TITLE_COL = "#ffffff"
-LINE_COL  = "#ff6b6b"
+# -------- ダークテーマ（見た目を元の黒基調へ） --------
+BG = "#0e0f12"
+FG = "#e6e6e6"
+GRID = "#2a2d34"
+LINE = "#ff6b6b"
 
-def load_series(csv_path: str):
-    df = pd.read_csv(csv_path)
-    time_col = None
-    for c in TIME_CANDIDATES:
+matplotlib.rcParams.update({
+    "figure.facecolor": BG,
+    "axes.facecolor": BG,
+    "savefig.facecolor": BG,
+    "text.color": FG,
+    "axes.edgecolor": FG,
+    "axes.labelcolor": FG,
+    "xtick.color": FG,
+    "ytick.color": FG,
+    "grid.color": GRID,
+    "grid.alpha": 0.28,
+    "grid.linestyle": "-",
+    "grid.linewidth": 0.6,
+    "axes.grid": True,
+    "font.size": 12,
+})
+
+def _pick_time_col(df: pd.DataFrame):
+    cand = ["Datetime","datetime","timestamp","time","date","ts"]
+    for c in cand:
         if c in df.columns:
-            time_col = c
-            break
-    if time_col is None:
-        time_col = df.columns[0]
-    value_cols = [c for c in df.columns if c != time_col]
-    if not value_cols:
-        raise ValueError("value column not found.")
-    vcol = value_cols[-1]
-    df[time_col] = pd.to_datetime(df[time_col], errors="coerce", utc=True)
-    df = df.dropna(subset=[time_col]).sort_values(time_col)
-    y = pd.to_numeric(df[vcol], errors="coerce")
-    df = df.assign(_y=y).dropna(subset=["_y"])
-    x = df[time_col].dt.tz_convert(None) if df[time_col].dt.tz is not None else df[time_col]
-    return x, df["_y"]
+            return c
+    # 1列目が時刻の CSV にも雑に対応
+    return df.columns[0]
 
-def save_chart(x, y, title: str, out_png: str):
-    fig, ax = plt.subplots(figsize=(12, 6), dpi=110)
-    # 背景
-    fig.patch.set_facecolor(DARK_BG)
-    ax.set_facecolor(AX_BG)
+def _pick_value_col(df: pd.DataFrame):
+    # インデックス列名の候補
+    k = INDEX_KEY
+    cands = [
+        k, k.upper(), k.title(), k.replace("_","-").upper(),
+        "value", "Value", "index", "score", "close", "price", "y",
+        "AIN-10", "AIN10"
+    ]
+    for c in cands:
+        if c in df.columns:
+            return c
+    # 最後の列を値とみなす（2列 CSV など）
+    return df.columns[-1]
 
-    # 線
-    ax.plot(x, y, LINE_COL, lw=2.2)
+def _load_series(csv_path: str) -> pd.DataFrame:
+    df = pd.read_csv(csv_path)
+    tcol = _pick_time_col(df)
+    vcol = _pick_value_col(df)
+    df = df[[tcol, vcol]].copy()
+    df[tcol] = pd.to_datetime(df[tcol], errors="coerce", utc=True)
+    df = df.dropna(subset=[tcol]).sort_values(tcol)
+    # 値は数値化
+    df[vcol] = pd.to_numeric(df[vcol], errors="coerce")
+    return df.rename(columns={tcol: "ts", vcol: "val"}).reset_index(drop=True)
 
-    # 体裁
-    ax.set_title(title, color=TITLE_COL, fontsize=18, pad=14)
-    ax.set_xlabel("Time", color=TICK_COL)
-    ax.set_ylabel("Index (level)", color=TICK_COL)
+def _title_case(label: str) -> str:
+    # AIN-10 表記などをできるだけ崩さないように
+    if label.lower() == "ain10" or label.lower() == "ain_10" or label.lower() == "ain-10":
+        return "AIN10"
+    return label.upper()
+
+def _format_xaxis(ax):
+    ax.xaxis.set_major_locator(AutoDateLocator(minticks=5, maxticks=10))
+    ax.xaxis.set_major_formatter(DateFormatter("%H:%M\n%Y-%m-%d", tz=timezone.utc))
     for spine in ax.spines.values():
-        spine.set_color(EDGE_COL)
-    ax.tick_params(colors=TICK_COL, labelsize=10)
-    ax.grid(True, which="major", color=GRID_COL, linewidth=1)
-    ax.grid(True, which="minor", color=GRID_COL, linewidth=0.5)
-    ax.margins(x=0.01, y=0.05)
+        spine.set_color(FG)
 
-    # x軸フォーマッタ
-    locator = mdates.AutoDateLocator()
-    formatter = mdates.ConciseDateFormatter(locator)
-    ax.xaxis.set_major_locator(locator)
-    ax.xaxis.set_major_formatter(formatter)
-    ax.minorticks_on()
+def _plot_one(csv_path: str, out_png: str, title_suffix: str):
+    if not os.path.exists(csv_path):
+        return
+    df = _load_series(csv_path)
+    if df.empty or df["val"].dropna().empty:
+        return
 
-    Path(out_png).parent.mkdir(parents=True, exist_ok=True)
-    plt.tight_layout()
-    fig.savefig(out_png, facecolor=DARK_BG, edgecolor=DARK_BG, bbox_inches="tight", pad_inches=0.3)
+    fig, ax = plt.subplots(figsize=(12, 5.6), dpi=120)
+    fig.patch.set_facecolor(BG)
+    ax.plot(df["ts"], df["val"], color=LINE, linewidth=1.8, solid_capstyle="round")
+
+    ax.set_title(f"{_title_case(INDEX_KEY)} ({title_suffix})", color=FG, fontsize=18, pad=12, weight="bold")
+    ax.set_xlabel("Time")
+    ax.set_ylabel("Index (level)")
+    _format_xaxis(ax)
+
+    # 余白を控えめに、黒縁の白抜け防止
+    fig.tight_layout()
+    fig.savefig(out_png, bbox_inches="tight", facecolor=fig.get_facecolor())
     plt.close(fig)
 
-def do_one(index_key: str, horizon: str):
-    csv = f"docs/outputs/{index_key}_{horizon}.csv"
-    png = f"docs/outputs/{index_key}_{horizon}.png"
-    if not Path(csv).exists():
-        return
-    x, y = load_series(csv)
-    title = f"{index_key.upper()} ({horizon})"
-    save_chart(x, y, title, png)
-
 def main():
-    index_key = os.environ.get("INDEX_KEY", "ain10")
-    for h in ["1d","7d","1m","1y"]:
-        do_one(index_key, h)
+    os.makedirs(OUT_DIR, exist_ok=True)
+    pairs = [
+        (f"{OUT_DIR}/{INDEX_KEY}_1d.csv", f"{OUT_DIR}/{INDEX_KEY}_1d.png", "1d"),
+        (f"{OUT_DIR}/{INDEX_KEY}_7d.csv", f"{OUT_DIR}/{INDEX_KEY}_7d.png", "7d"),
+        (f"{OUT_DIR}/{INDEX_KEY}_1m.csv", f"{OUT_DIR}/{INDEX_KEY}_1m.png", "1m"),
+        (f"{OUT_DIR}/{INDEX_KEY}_1y.csv", f"{OUT_DIR}/{INDEX_KEY}_1y.png", "1y"),
+    ]
+    for csv_path, out_png, label in pairs:
+        _plot_one(csv_path, out_png, label)
 
 if __name__ == "__main__":
     main()
