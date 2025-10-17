@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import argparse, json, math
+import argparse, json
 from pathlib import Path
 import pandas as pd
 from typing import Optional
 
-EPS = 1e-6          # 非ゼロ判定のしきい値
-SAFE_WINDOW_MIN = 5 # 市場オープンから最初の探索オフセット(分)
-MAX_WINDOW_MIN  = 30# この分数までに非ゼロが見つからなければ全体から探す
+EPS = 1e-6
+MINUTES_AFTER_OPEN = 30  # 最初の30分はノイズ扱い
 
 def iso_now() -> str:
     """UTCのISO8601(Z付き)"""
@@ -24,36 +23,28 @@ def read_1d(csv_path: Path) -> pd.DataFrame:
     df = df.dropna(subset=["ts", "val"]).sort_values("ts").reset_index(drop=True)
     return df
 
-def find_nonzero_open(df: pd.DataFrame) -> tuple[Optional[float], str]:
+def find_stable_open(df: pd.DataFrame) -> tuple[Optional[float], str]:
     """
-    オープン(最初の行)直後の“実質ゼロでない”最初の値を探す。
-    - オープン時刻 + SAFE_WINDOW_MIN 〜 +MAX_WINDOW_MIN の範囲を優先
-    - 見つからなければ全体で最初の非ゼロ
-    戻り値: (値, basis_note)
+    開始直後ではなく、安定した最初の値を基準にする
     """
     if df.empty:
         return None, "n/a"
 
     t0 = df.iloc[0]["ts"]
-    lower = t0 + pd.Timedelta(minutes=SAFE_WINDOW_MIN)
-    upper = t0 + pd.Timedelta(minutes=MAX_WINDOW_MIN)
+    later = t0 + pd.Timedelta(minutes=MINUTES_AFTER_OPEN)
 
-    m = (df["ts"] >= lower) & (df["ts"] <= upper) & (df["val"].abs() >= EPS)
+    # 開始30分以降の最初の値を使う（なければ中央値）
+    m = df["ts"] >= later
     if m.any():
-        row = df[m].iloc[0]
-        when = pd.to_datetime(row["ts"])
-        return float(row["val"]), f"open(nonzero@{when.strftime('%H:%M')})"
-
-    m2 = (df["val"].abs() >= EPS)
-    if m2.any():
-        row = df[m2].iloc[0]
-        when = pd.to_datetime(row["ts"])
-        return float(row["val"]), f"open(first_nonzero@{when.strftime('%H:%M')})"
-
-    return None, "open(all_zero)"
+        val = float(df[m].iloc[0]["val"])
+        ts = pd.to_datetime(df[m].iloc[0]["ts"])
+        return val, f"stable@{ts.strftime('%H:%M')}"
+    else:
+        # 開始から終了までの中央値（全体の中間値）を採用
+        median_row = df.iloc[len(df)//2]
+        return float(median_row["val"]), f"median@{pd.to_datetime(median_row['ts']).strftime('%H:%M')}"
 
 def percent_change(first: float, last: float) -> Optional[float]:
-    """NaNや0割防止付きの単純騰落率(%単位)"""
     try:
         if first is None or last is None:
             return None
@@ -72,7 +63,6 @@ def main():
     ap.add_argument("--out-json", required=True)
     ap.add_argument("--out-text", required=True)
     ap.add_argument("--basis", choices=["open", "prev_close"], default="open")
-    # ← 互換目的で受け取って無視する（ワークフローが渡しても落ちないように）
     ap.add_argument("--history", required=False)
     args = ap.parse_args()
 
@@ -89,13 +79,12 @@ def main():
         last_val  = float(last_row["val"])
         valid_note = f"{first_row['ts']}->{last_row['ts']}"
 
-        base_val, base_note = find_nonzero_open(df)
-        basis_note = base_note if args.basis == "open" else "prev_close"
+        base_val, base_note = find_stable_open(df)
+        basis_note = base_note
 
         delta_level = last_val - float(first_row["val"])
         pct_val = percent_change(base_val, last_val)
 
-    # --- TXT 出力
     pct_str   = "N/A" if pct_val is None else f"{pct_val:+.2f}%"
     delta_str = "N/A" if delta_level is None else f"{delta_level:+.6f}"
     text = (
@@ -104,7 +93,6 @@ def main():
     )
     Path(args.out_text).write_text(text, encoding="utf-8")
 
-    # --- JSON 出力
     payload = {
         "index_key": args.index_key,
         "pct_1d": None if pct_val is None else float(pct_val),
