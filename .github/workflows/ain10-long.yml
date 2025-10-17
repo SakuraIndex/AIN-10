@@ -3,7 +3,7 @@ name: Generate long-term charts (1d/7d/1m/1y + stats + intraday)
 on:
   workflow_dispatch:
   schedule:
-    - cron: "15 20 * * *" # UTC
+    - cron: "15 20 * * *"   # UTC
 
 permissions:
   contents: write
@@ -41,10 +41,10 @@ jobs:
           elif [ -f src/requirements.txt ]; then
             pip install -r src/requirements.txt
           else
-            pip install pandas numpy matplotlib pytz tzdata
+            pip install pandas numpy matplotlib pytz python-dateutil
           fi
 
-      # 1) チャート生成（黒背景 / 白枠なし）
+      # 1d/7d/1m/1y の画像と CSV を作る（チャートはダーク/赤、枠線なし）
       - name: Generate long-term charts
         env:
           INDEX_KEY: ${{ env.INDEX_KEY }}
@@ -54,7 +54,7 @@ jobs:
           echo "---- LIST AFTER CHARTS ----"
           ls -al docs/outputs || true
 
-      # 2) 1d騰落率（当日 open→latest）を算出して stats.json / post_intraday.txt を更新
+      # 1日騰落率（X 投稿用の%）を算出して post と stats を更新
       - name: Compute 1d percent & write posts
         env:
           INDEX_KEY: ${{ env.INDEX_KEY }}
@@ -63,9 +63,9 @@ jobs:
           python scripts/ain10_pct_post.py \
             --index-key "${INDEX_KEY}" \
             --csv "docs/outputs/${INDEX_KEY}_1d.csv" \
+            --history "docs/outputs/${INDEX_KEY}_history.csv" \
             --out-json "docs/outputs/${INDEX_KEY}_stats.json" \
-            --out-text "docs/outputs/${INDEX_KEY}_post_intraday.txt" \
-            --session "09:30-15:50"
+            --out-text "docs/outputs/${INDEX_KEY}_post_intraday.txt"
 
       - name: Upload artifacts (for debug)
         if: always()
@@ -91,6 +91,7 @@ jobs:
           git add docs/outputs/${{ env.INDEX_KEY }}_7d.csv || true
           git add docs/outputs/${{ env.INDEX_KEY }}_1m.csv || true
           git add docs/outputs/${{ env.INDEX_KEY }}_1y.csv || true
+          git add docs/outputs/${{ env.INDEX_KEY }}_history.csv || true
 
           # 投稿テキスト・統計
           git add docs/outputs/${{ env.INDEX_KEY }}_post_intraday.txt || true
