@@ -1,101 +1,142 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+"""
+Compute 1-day percentage change for X posting and update stats.
+
+- 入力: docs/outputs/{index}_1d.csv（Datetime + level 列）
+- ロジック:
+    基本は「前営業日の最終値」を基準（basis='prev_close'）。
+    もし前日データが無い場合は「当日の最初の値」を基準（basis='open'）。
+- 出力:
+    docs/outputs/{index}_post_intraday.txt   ← Xに貼る短文
+    docs/outputs/{index}_stats.json          ← pct_1d / delta_level / basis を更新（scale=level）
+
+環境変数:
+    INDEX_KEY: 例 'ain10'
+"""
+
+from __future__ import annotations
+import os
 import json
-import sys
-from pathlib import Path
-
+import pathlib as p
 import pandas as pd
+import numpy as np
 
-ROOT = Path(__file__).resolve().parents[1]
-OUT = ROOT / "docs" / "outputs"
+OUT_DIR = p.Path("docs/outputs")
 
-HISTORY_CSV = OUT / "ain10_history.csv"   # 日次の終値が入っている想定
-STATS_JSON  = OUT / "ain10_stats.json"
-POST_TXT    = OUT / "ain10_post_intraday.txt"
+def _detect_cols(df: pd.DataFrame):
+    time_cands = ["Datetime","datetime","timestamp","time","date","Date"]
+    val_cands  = ["value","level","score","close","price","AIN-10"]
 
-INDEX_KEY = "ain10"
+    tcol = next((c for c in time_cands if c in df.columns), None)
+    if tcol is None:
+        # indexがDatetimeIndexなら救済
+        if isinstance(df.index, pd.DatetimeIndex):
+            df = df.reset_index().rename(columns={"index": "Datetime"})
+            tcol = "Datetime"
+        else:
+            # 先頭で時刻に変換できる列を探す
+            for c in df.columns:
+                try:
+                    pd.to_datetime(df[c])
+                    tcol = c
+                    break
+                except Exception:
+                    pass
+    if tcol is None:
+        raise ValueError(f"time-like column not found. columns={list(df.columns)}")
 
-def load_history(path: Path) -> pd.DataFrame:
-    if not path.exists():
-        raise FileNotFoundError(f"history csv not found: {path}")
-    df = pd.read_csv(path)
-    # 列名のゆらぎを吸収
-    # 期待: date(またはtimestamp), close(またはprice/value)
-    cols = {c.lower(): c for c in df.columns}
-    date_col = None
-    for k in ("date", "timestamp"):
-        if k in cols:
-            date_col = cols[k]
-            break
-    value_col = None
-    for k in ("close", "price", "value"):
-        if k in cols:
-            value_col = cols[k]
-            break
-    if date_col is None or value_col is None:
-        raise ValueError(
-            f"Required columns not found. Need one of date/timestamp and close/price/value. got: {list(df.columns)}"
-        )
-    df = df[[date_col, value_col]].rename(columns={date_col: "date", value_col: "close"})
-    # 並び替え＆欠損除去
-    df["date"] = pd.to_datetime(df["date"])
-    df = df.sort_values("date").dropna(subset=["close"])
+    vcol = next((c for c in val_cands if c in df.columns), None)
+    if vcol is None:
+        numeric = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
+        if not numeric:
+            raise ValueError("value-like column not found.")
+        vcol = numeric[0]
+
+    return df, tcol, vcol
+
+def load_1d(index_key: str) -> pd.DataFrame:
+    csv_path = OUT_DIR / f"{index_key}_1d.csv"
+    if not csv_path.exists():
+        raise SystemExit(f"missing CSV: {csv_path}")
+    df = pd.read_csv(csv_path)
+    df, tcol, vcol = _detect_cols(df)
+    df[tcol] = pd.to_datetime(df[tcol], errors="coerce")
+    df = df.dropna(subset=[tcol]).sort_values(tcol)
+    df = df[[tcol, vcol]].rename(columns={tcol: "ts", vcol: "level"})
     return df
 
-def compute_pct_1d(df: pd.DataFrame):
-    if len(df) < 2:
-        return None, None, None
-    last = df.iloc[-1]
-    prev = df.iloc[-2]
-    prev_close = float(prev["close"])
-    last_close = float(last["close"])
-    if prev_close == 0:
-        return None, prev["date"].date().isoformat(), last["date"].date().isoformat()
-    pct = (last_close - prev_close) / prev_close * 100.0
-    return pct, prev["date"].date().isoformat(), last["date"].date().isoformat()
+def compute_pct(df: pd.DataFrame):
+    # 最新日の切り出し
+    df["date"] = df["ts"].dt.date
+    cur_date = df["date"].iloc[-1]
+    day_df = df[df["date"] == cur_date]
+    latest_ts  = day_df["ts"].iloc[-1]
+    latest_val = float(day_df["level"].iloc[-1])
 
-def update_stats_json(pct_1d: float | None):
-    # 既存のキーは維持して追記/更新
-    stats = {
-        "index_key": INDEX_KEY,
-        "pct_1d": None,
-        "delta_level": None,
-        "scale": "level",
-        "basis": "n/a",
-        "updated_at": pd.Timestamp.utcnow().isoformat(timespec="seconds") + "Z",
-    }
-    if STATS_JSON.exists():
-        try:
-            existing = json.loads(STATS_JSON.read_text(encoding="utf-8"))
-            if isinstance(existing, dict):
-                stats |= existing
-        except Exception:
-            pass
-    stats["index_key"] = INDEX_KEY
-    stats["pct_1d"] = round(pct_1d, 6) if pct_1d is not None else None
-    STATS_JSON.write_text(json.dumps(stats, ensure_ascii=False), encoding="utf-8")
-
-def write_post_txt(pct_1d: float | None, prev_d: str | None, last_d: str | None):
-    if pct_1d is None or prev_d is None or last_d is None:
-        line = "AIN10 1d: A%=N/A (basis n/a)"
+    # デフォルト：前日終値基準
+    prev_dates = sorted(df["date"].unique())
+    prev_dates = [d for d in prev_dates if d < cur_date]
+    if prev_dates:
+        prev_day = prev_dates[-1]
+        prev_close = float(df[df["date"] == prev_day]["level"].iloc[-1])
+        basis_val = prev_close
+        basis = "prev_close"
+        valid_note = f"{prev_day} -> {cur_date}"
     else:
-        sign = "+" if pct_1d >= 0 else ""
-        line = f"AIN10 1d: A%={sign}{pct_1d:.2f}% (basis prev-close {prev_d}->{last_d})"
-    POST_TXT.write_text(line + "\n", encoding="utf-8")
+        # 前日がないなら当日始値
+        basis_val = float(day_df["level"].iloc[0])
+        basis = "open"
+        valid_note = f"{cur_date} open -> latest"
+
+    delta_level = latest_val - basis_val
+    # 0割り防止：絶対値が極小なら%は0扱い
+    if abs(basis_val) < 1e-12:
+        pct = 0.0
+    else:
+        pct = (latest_val - basis_val) / abs(basis_val) * 100.0
+
+    return delta_level, pct, basis, valid_note, latest_ts
+
+def write_post(index_key: str, delta_level: float, pct: float,
+               basis: str, valid_note: str):
+    txt = (
+        f"{index_key.upper()} 1d: Δ={delta_level:+.6f} (level) "
+        f"A%={pct:+.2f}% (basis={basis} valid={valid_note})"
+    )
+    (OUT_DIR / f"{index_key}_post_intraday.txt").write_text(txt, encoding="utf-8")
+
+def update_stats(index_key: str, delta_level: float, pct: float, basis: str):
+    # 既存 stats があれば読み、無ければ新規
+    stats_path = OUT_DIR / f"{index_key}_stats.json"
+    if stats_path.exists():
+        try:
+            stats = json.loads(stats_path.read_text(encoding="utf-8"))
+        except Exception:
+            stats = {}
+    else:
+        stats = {}
+
+    stats.update({
+        "index_key": index_key,
+        "pct_1d": pct,
+        "delta_level": delta_level,
+        "scale": "level",
+        "basis": basis,
+        "updated_at": pd.Timestamp.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+    })
+    stats_path.write_text(json.dumps(stats, ensure_ascii=False), encoding="utf-8")
 
 def main():
-    try:
-        df = load_history(HISTORY_CSV)
-        pct_1d, prev_d, last_d = compute_pct_1d(df)
-        update_stats_json(pct_1d)
-        write_post_txt(pct_1d, prev_d, last_d)
-        print("ok")
-    except Exception as e:
-        # 失敗時は N/A を残して終了（CI を落とさない）
-        update_stats_json(None)
-        write_post_txt(None, None, None)
-        print(f"warn: {e}", file=sys.stderr)
+    index_key = os.environ.get("INDEX_KEY", "").strip()
+    if not index_key:
+        raise SystemExit("Env INDEX_KEY is required (e.g. ain10)")
+
+    df = load_1d(index_key)
+    delta_level, pct, basis, valid_note, latest_ts = compute_pct(df)
+    write_post(index_key, delta_level, pct, basis, valid_note)
+    update_stats(index_key, delta_level, pct, basis)
 
 if __name__ == "__main__":
     main()
