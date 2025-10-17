@@ -1,176 +1,134 @@
-# scripts/ain10_pct_post.py
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-AIN-10 ほか共通: 1日の騰落率を robust に計算して
-docs/outputs/{key}_stats.json と {key}_post_intraday.txt を更新する。
-- 優先: intraday の [今日の最初値, 最新値]
-- 代替: history の [前営業日終値, 最新終値]
-- 未取得: N/A
-"""
 
-from __future__ import annotations
+import argparse
 import json
-import math
-import os
-from datetime import datetime, timezone
+from datetime import timezone
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
-KEY = os.environ.get("INDEX_KEY", "ain10")
-OUT_DIR = Path("docs/outputs")
-TZ = timezone.utc  # すべてUTCで記録（表示の都合で）
 
-# 候補にする列名（先に見つかったものを使う）
-VALUE_CANDIDATES = [
-    # 価格系（最優先）
-    "price", "close", "Close", "last", "adj_close",
-    # スコア/レベル系（やむなく代替。当日比%の概算として扱う）
-    "value", "y", "index", "score", "AIN-10", KEY.upper(), KEY,
-]
+def find_datetime_col(df: pd.DataFrame) -> str:
+    # 先頭候補を強めに推す
+    for c in df.columns:
+        lc = c.lower()
+        if lc in ("datetime", "timestamp", "ts", "time", "date"):
+            return c
+    # 見つからなければ1列目を日時として解釈
+    return df.columns[0]
 
-TS_CANDIDATES = ["ts", "time", "timestamp", "date", "datetime", "Datetime"]
 
-def _now_iso() -> str:
-    return datetime.now(TZ).strftime("%Y-%m-%dT%H:%M:%SZ")
+def find_value_col(df: pd.DataFrame) -> str:
+    # 価格(終値/ラスト)候補
+    prefs = ["close", "last", "price", "value", "val"]
+    for p in prefs:
+        for c in df.columns:
+            if p in c.lower():
+                return c
+    # だめなら2列目(1列目は日時のはず)
+    return df.columns[1]
 
-def _load_csv(path: Path) -> pd.DataFrame | None:
-    if not path.exists():
-        return None
-    try:
-        df = pd.read_csv(path)
-    except Exception:
-        return None
-    # タイムスタンプ列の標準化
-    for c in TS_CANDIDATES:
-        if c in df.columns:
-            df["_ts"] = pd.to_datetime(df[c], errors="coerce", utc=True)
-            break
-    else:
-        df["_ts"] = pd.NaT
 
-    # 値段/値列の特定
-    val_col = None
-    for c in VALUE_CANDIDATES:
-        if c in df.columns:
-            val_col = c
-            break
-    # 数値の列が1つしかない場合、それを採用（列名不明対策）
-    if val_col is None:
-        num_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
-        if len(num_cols) == 1:
-            val_col = num_cols[0]
+def find_open_col(df: pd.DataFrame) -> str | None:
+    for c in df.columns:
+        if "open" in c.lower():
+            return c
+    return None
 
-    if val_col is None:
-        return None
 
-    # 数値化
-    df["_v"] = pd.to_numeric(df[val_col], errors="coerce")
-    df = df.dropna(subset=["_v"]).copy()
+def pct_from_intraday_open_latest(df: pd.DataFrame) -> tuple[float | None, dict]:
+    """
+    同一営業日の 'open' → 'latest' で % を計算する。
+    戻り値: (pct_1d, meta)
+    meta = {"basis": "open", "valid": "YYYY-MM-DD open -> latest"}
+    """
+    # 日時
+    tcol = find_datetime_col(df)
+    df = df.copy()
+    df[tcol] = pd.to_datetime(df[tcol], utc=False, errors="coerce")
+    df = df.dropna(subset=[tcol])
     if df.empty:
-        return None
+        return None, {"basis": "n/a", "valid": "n/a"}
 
-    # ソート（時系列）
-    if df["_ts"].notna().any():
-        df = df.sort_values("_ts")
-    return df
+    # 直近営業日のデータだけに絞る
+    last_day = df[tcol].dt.date.max()
+    day_df = df[df[tcol].dt.date == last_day].copy()
+    if day_df.empty:
+        return None, {"basis": "n/a", "valid": "n/a"}
 
-def _first_last_today(df: pd.DataFrame) -> tuple[float | None, float | None, str]:
-    """UTC日付で今日の first/last を返す。basis 文字列も返す。"""
-    if "_ts" not in df.columns or df["_ts"].isna().all():
-        return None, None, "n/a"
+    vcol = find_value_col(day_df)
+    ocol = find_open_col(day_df)
 
-    today = datetime.now(TZ).date()
-    dft = df[df["_ts"].dt.date == today]
-    if dft.empty:
-        return None, None, "n/a"
-
-    first = float(dft.iloc[0]["_v"])
-    last = float(dft.iloc[-1]["_v"])
-    valid = f"{dft.iloc[0]['_ts'].strftime('%Y-%m-%d %H:%M')} -> latest"
-    return first, last, f"open (valid={valid})"
-
-def _prev_close_vs_last(df: pd.DataFrame) -> tuple[float | None, float | None, str]:
-    """前営業日終値と最新行で計算。時系列が無ければ全体の先頭/末尾。"""
-    if "_ts" in df.columns and df["_ts"].notna().any():
-        df = df.sort_values("_ts")
-    # 同一日ごとに末尾＝終値を採り、直近2日を使う
-    if "_ts" in df.columns and df["_ts"].notna().any():
-        dd = df.copy()
-        dd["date"] = dd["_ts"].dt.date
-        last_by_day = dd.groupby("date").tail(1)
-        if len(last_by_day) >= 2:
-            prev = float(last_by_day.iloc[-2]["_v"])
-            last = float(last_by_day.iloc[-1]["_v"])
-            valid = f"{last_by_day.iloc[-2]['_ts'].strftime('%Y-%m-%d')} close -> latest"
-            return prev, last, f"prev_close (valid={valid})"
-
-    # 仕方なく全体先頭/末尾
-    prev = float(df.iloc[0]["_v"])
-    last = float(df.iloc[-1]["_v"])
-    return prev, last, "prev_any"
-
-def _pct(a: float, b: float) -> float | None:
-    # (b - a) / a * 100
-    if a is None or b is None:
-        return None
-    if a == 0 or not math.isfinite(a) or not math.isfinite(b):
-        return None
-    return (b - a) / a * 100.0
-
-def compute_pct_1d() -> tuple[float | None, str]:
-    """
-    returns: (pct, basis)
-    """
-    intraday = _load_csv(OUT_DIR / f"{KEY}_intraday.csv")
-    if intraday is not None:
-        a, b, basis = _first_last_today(intraday)
-        p = _pct(a, b)
-        if p is not None:
-            return p, basis
-
-    # 代替：ヒストリー（前日終値→最新終値）
-    history = _load_csv(OUT_DIR / f"{KEY}_history.csv")
-    if history is not None:
-        a, b, basis = _prev_close_vs_last(history)
-        p = _pct(a, b)
-        if p is not None:
-            return p, basis
-
-    return None, "n/a"
-
-def update_files(pct: float | None, basis: str):
-    # stats.json
-    stats_path = OUT_DIR / f"{KEY}_stats.json"
-    stats = {
-        "index_key": KEY,
-        "pct_1d": None if pct is None else float(pct),
-        "delta_level": None,  # レベルΔは別処理（長期チャート側で管理）
-        "scale": "level",
-        "basis": basis,
-        "updated_at": _now_iso(),
-    }
-    try:
-        stats_path.write_text(json.dumps(stats, ensure_ascii=False))
-    except Exception as e:
-        print("write stats error:", e)
-
-    # post_intraday.txt
-    post_path = OUT_DIR / f"{KEY}_post_intraday.txt"
-    if pct is None:
-        pct_str = "N/A"
+    # open 値
+    if ocol and ocol in day_df.columns:
+        open_val = day_df[ocol].dropna().iloc[0] if day_df[ocol].notna().any() else None
     else:
-        sign = "+" if pct >= 0 else ""
-        pct_str = f"{sign}{pct:.2f}%"
-    line = f"{KEY.upper()} 1d: Δ=N/A (level) A%={pct_str} (basis={basis})\n"
-    try:
-        post_path.write_text(line)
-    except Exception as e:
-        print("write post error:", e)
+        # open列が無ければ、その日の最初の価格を open とみなす
+        open_val = day_df[vcol].dropna().iloc[0] if day_df[vcol].notna().any() else None
+
+    # latest 値
+    latest_val = day_df[vcol].dropna().iloc[-1] if day_df[vcol].notna().any() else None
+
+    if open_val is None or latest_val is None:
+        return None, {"basis": "n/a", "valid": "n/a"}
+
+    # 価格系列を想定(>0)。0/負値なら安全側で N/A
+    if not np.isfinite(open_val) or not np.isfinite(latest_val) or open_val <= 0:
+        return None, {"basis": "n/a", "valid": "n/a"}
+
+    pct = (latest_val / open_val - 1.0) * 100.0
+    meta = {
+        "basis": "open",
+        "valid": f"{last_day} open -> latest",
+    }
+    return float(pct), meta
+
 
 def main():
-    pct, basis = compute_pct_1d()
-    update_files(pct, basis)
+    ap = argparse.ArgumentParser(description="Compute 1d % for X post from intraday price CSV.")
+    ap.add_argument("--index-key", required=True)
+    ap.add_argument(
+        "--csv",
+        required=True,
+        help="intraday price CSV (must contain datetime + price columns; open column optional)",
+    )
+    ap.add_argument("--out-json", required=True, help="path to stats json")
+    ap.add_argument("--out-text", required=True, help="path to post text")
+    args = ap.parse_args()
+
+    csv_path = Path(args.csv)
+    if not csv_path.exists():
+        raise FileNotFoundError(csv_path)
+
+    df = pd.read_csv(csv_path)
+
+    pct_1d, meta = pct_from_intraday_open_latest(df)
+
+    # JSON (サイト向けマーカー)
+    out = {
+        "index_key": args.index_key,
+        "pct_1d": None if pct_1d is None else float(pct_1d),
+        "delta_level": None,     # レベルは%にしない方針
+        "scale": "level",
+        "basis": meta.get("basis", "n/a"),
+        "updated_at": pd.Timestamp.utcnow().replace(tzinfo=timezone.utc).isoformat().replace("+00:00", "Z"),
+    }
+    Path(args.out_json).write_text(json.dumps(out, ensure_ascii=False))
+
+    # X 投稿テキスト
+    if pct_1d is None:
+        a_pct = "N/A"
+    else:
+        a_pct = f"{pct_1d:+.2f}%"
+
+    line = (
+        f"{args.index_key.upper()} 1d: Δ=N/A (level) "
+        f"A%={a_pct} (basis={meta.get('basis','n/a')} valid={meta.get('valid','n/a')})"
+    )
+    Path(args.out_text).write_text(line + "\n")
+
 
 if __name__ == "__main__":
     main()
