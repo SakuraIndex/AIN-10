@@ -3,7 +3,7 @@ name: Generate long-term charts (1d/7d/1m/1y + stats + intraday)
 on:
   workflow_dispatch:
   schedule:
-    # UTC。必要に応じて調整（例: 毎日 20:15 UTC）
+    # UTC（必要に応じて調整）
     - cron: "15 20 * * *"
 
 permissions:
@@ -14,7 +14,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  # ★ このリポのインデックスキー（AIN-10）
+  # このリポのインデックスキー
   INDEX_KEY: ain10
 
 jobs:
@@ -46,7 +46,7 @@ jobs:
             pip install pandas numpy matplotlib
           fi
 
-      # --- チャート生成（1d/7d/1m/1y、画像やCSVを docs/outputs に出力）---
+      # 1d/7d/1m/1y のレベルチャート生成（CSVも出力）
       - name: Generate long-term charts
         env:
           INDEX_KEY: ${{ env.INDEX_KEY }}
@@ -56,7 +56,7 @@ jobs:
           echo "---- LIST AFTER CHARTS ----"
           ls -al docs/outputs || true
 
-      # --- 1日騰落率（open→latest）を計算して投稿テキストとJSONを更新 ---
+      # intraday 価格CSVから 1日% を計算（レベルは常に N/A）
       - name: Compute 1d percent & write posts
         env:
           INDEX_KEY: ${{ env.INDEX_KEY }}
@@ -64,11 +64,11 @@ jobs:
           set -e
           python scripts/ain10_pct_post.py \
             --index-key "${INDEX_KEY}" \
-            --csv "docs/outputs/${INDEX_KEY}_1d.csv" \
+            --csv "docs/outputs/${INDEX_KEY}_intraday.csv" \
             --out-json "docs/outputs/${INDEX_KEY}_stats.json" \
             --out-text "docs/outputs/${INDEX_KEY}_post_intraday.txt"
 
-      # （必要なら）成果物をアーティファクトとして保存
+      # デバッグ用に成果物を保存（任意）
       - name: Upload artifacts (for debug)
         if: always()
         uses: actions/upload-artifact@v4
@@ -76,7 +76,7 @@ jobs:
           name: outputs
           path: docs/outputs
 
-      # --- 生成物のコミット ---
+      # 生成物のコミット
       - name: Commit charts if changed
         run: |
           set -e
@@ -94,6 +94,7 @@ jobs:
           git add docs/outputs/${{ env.INDEX_KEY }}_7d.csv || true
           git add docs/outputs/${{ env.INDEX_KEY }}_1m.csv || true
           git add docs/outputs/${{ env.INDEX_KEY }}_1y.csv || true
+          git add docs/outputs/${{ env.INDEX_KEY }}_intraday.csv || true
 
           # 投稿テキスト・統計
           git add docs/outputs/${{ env.INDEX_KEY }}_post_intraday.txt || true
