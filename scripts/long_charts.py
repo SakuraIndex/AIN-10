@@ -1,98 +1,113 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+"""
+長期チャート生成スクリプト（完全安定版）
+
+✅ 修正点：
+- matplotlib バージョン差異対応（AutoDateLocator, AutoDateFormatter の import 安全化）
+- チャートは黒背景・外枠なし・赤線・落ち着いたグリッド
+- CSV カラム名に依存しない（先頭列=時刻, 2列目=値 として解釈）
+"""
+
 import os
 from pathlib import Path
-from datetime import timezone
-
 import pandas as pd
-import numpy as np
 import matplotlib.pyplot as plt
-from matplotlib.ticker import MaxNLocator, AutoDateLocator, AutoDateFormatter
-
+import matplotlib.dates as mdates
+from matplotlib.ticker import MaxNLocator
 
 INDEX_KEY = os.environ.get("INDEX_KEY", "ain10").lower()
 OUT_DIR = Path("docs/outputs")
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
-# スパン定義
 SPANS = ["1d", "7d", "1m", "1y"]
 
+# ====== デザイン設定 ======
+BG = "#0d0e11"
+FG = "#d7d7d7"
+GRID = "#2c2f33"
+LINE = "#ff5c5c"
 
-def _load_csv_generic(path: Path) -> pd.DataFrame:
-    """先頭列=時刻, 2列目=値 として解釈して DataFrame[ts,val] を返す。"""
-    df = pd.read_csv(path)
+plt.rcParams.update({
+    "figure.facecolor": BG,
+    "axes.facecolor": BG,
+    "savefig.facecolor": BG,
+    "axes.edgecolor": BG,  # 外枠線を削除
+    "axes.labelcolor": FG,
+    "xtick.color": FG,
+    "ytick.color": FG,
+    "grid.color": GRID,
+    "grid.alpha": 0.25,
+    "font.size": 11,
+})
+
+
+# ====== CSV 読み込み ======
+def load_series(csv_path: Path) -> pd.DataFrame:
+    df = pd.read_csv(csv_path)
     if df.shape[1] < 2:
-        raise ValueError(f"CSV columns insufficient: {path}")
+        raise ValueError(f"CSV列が足りません: {csv_path}")
+
     ts_col = df.columns[0]
     val_col = df.columns[1]
-    out = pd.DataFrame({
+
+    df = pd.DataFrame({
         "ts": pd.to_datetime(df[ts_col], errors="coerce"),
         "val": pd.to_numeric(df[val_col], errors="coerce")
-    }).dropna(subset=["ts"])
-    return out.sort_values("ts").reset_index(drop=True)
+    }).dropna(subset=["ts", "val"])
+    return df.sort_values("ts").reset_index(drop=True)
 
 
-def _read_span_csv(span: str) -> pd.DataFrame:
-    return _load_csv_generic(OUT_DIR / f"{INDEX_KEY}_{span}.csv")
+# ====== チャート描画 ======
+def plot_chart(csv_path: Path, out_path: Path, label: str):
+    if not csv_path.exists():
+        print(f"[WARN] Missing {csv_path}")
+        return
 
+    df = load_series(csv_path)
+    if df.empty:
+        print(f"[WARN] Empty data: {csv_path}")
+        return
 
-def _apply_dark_style(ax: plt.Axes):
-    """落ち着いた黒ベース / 目にうるさくないグリッド / 枠線なし。"""
-    # 背景
-    ax.set_facecolor("#0E1116")               # 深いダークグレー
-    ax.figure.set_facecolor("#0E1116")
+    fig, ax = plt.subplots(figsize=(12, 5), dpi=110)
+    fig.patch.set_facecolor(BG)
+    ax.set_facecolor(BG)
 
-    # 枠線(スパイン)除去
+    ax.plot(df["ts"], df["val"], color=LINE, lw=2.0)
+    ax.set_title(f"{INDEX_KEY.upper()} ({label})", color=FG, fontsize=17, pad=12)
+    ax.set_xlabel("Time")
+    ax.set_ylabel("Index (level)")
+
+    # === 枠線削除 ===
     for spine in ax.spines.values():
         spine.set_visible(False)
 
-    # グリッドは控えめに
-    ax.grid(True, linestyle="-", linewidth=0.6, alpha=0.22, which="both")
+    # === グリッド ===
+    ax.grid(True, alpha=0.25)
 
-    # 目盛り色を淡色に
-    ax.tick_params(colors="#C9CCD5", labelsize=10)
+    # === 軸フォーマット（日付軸） ===
+    try:
+        locator = mdates.AutoDateLocator()
+        formatter = mdates.ConciseDateFormatter(locator)
+        ax.xaxis.set_major_locator(locator)
+        ax.xaxis.set_major_formatter(formatter)
+    except Exception:
+        ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M\n%Y-%m-%d"))
+
     ax.yaxis.set_major_locator(MaxNLocator(nbins=6, prune=None))
 
-    # 軸ラベル・タイトル色
-    ax.set_xlabel("Time", color="#DADDE5", labelpad=8)
-    ax.set_ylabel("Index (level)", color="#DADDE5", labelpad=8)
-    ax.title.set_color("#FFFFFF")
-
-
-def _line_color():
-    # 落ち着いた赤 (#ff6b6b系は明る過ぎるので少し暗め)
-    return "#FF6B6B"
-
-
-def plot_span(span: str):
-    df = _read_span_csv(span)
-    if df.empty:
-        return
-
-    fig, ax = plt.subplots(figsize=(12, 6), dpi=110)
-    _apply_dark_style(ax)
-
-    # 日付軸
-    locator = AutoDateLocator()
-    formatter = AutoDateFormatter(locator)
-    ax.xaxis.set_major_locator(locator)
-    ax.xaxis.set_major_formatter(formatter)
-    fig.autofmt_xdate()
-
-    ax.plot(df["ts"], df["val"], linewidth=2.25, color=_line_color())
-
-    ax.set_title(f"{INDEX_KEY.upper()} ({span})", fontsize=20, pad=14)
-    out = OUT_DIR / f"{INDEX_KEY}_{span}.png"
-    fig.savefig(out, bbox_inches="tight", facecolor=fig.get_facecolor())
+    plt.tight_layout()
+    fig.savefig(out_path, bbox_inches="tight", facecolor=fig.get_facecolor())
     plt.close(fig)
 
 
 def main():
     for span in SPANS:
-        csv = OUT_DIR / f"{INDEX_KEY}_{span}.csv"
-        if csv.exists():
-            plot_span(span)
+        csv_file = OUT_DIR / f"{INDEX_KEY}_{span}.csv"
+        out_png = OUT_DIR / f"{INDEX_KEY}_{span}.png"
+        if csv_file.exists():
+            plot_chart(csv_file, out_png, span)
 
 
 if __name__ == "__main__":
