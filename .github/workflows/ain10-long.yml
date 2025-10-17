@@ -3,21 +3,17 @@ name: Generate long-term charts (1d/7d/1m/1y + stats + intraday)
 on:
   workflow_dispatch:
   schedule:
-    # 毎日 20:15 UTC（必要に応じて調整）
-    - cron: "15 20 * * *"
+    - cron: "15 20 * * *"   # UTC
 
 permissions:
   contents: write
 
-# 他WFとぶつからないよう強めにブロック
 concurrency:
-  group: ain10
-  cancel-in-progress: true
+  group: long-charts-${{ github.ref }}
+  cancel-in-progress: false
 
 env:
   INDEX_KEY: ain10
-  THEME: dark              # "dark" / "light"
-  # LINE_COLOR: "#ff6b6b"  # 必要なら上書き
 
 jobs:
   build:
@@ -48,20 +44,14 @@ jobs:
             pip install pandas numpy matplotlib
           fi
 
-      # 画像/CSVだけを生成（post/statは触らない）
       - name: Generate long-term charts
         env:
           INDEX_KEY: ${{ env.INDEX_KEY }}
-          THEME: ${{ env.THEME }}
-          LINE_COLOR: ${{ env.LINE_COLOR }}
-          WRITE_PLACEHOLDER: "0"
         run: |
           set -e
           python scripts/long_charts.py
-          echo "---- LIST AFTER CHARTS ----"
           ls -al docs/outputs || true
 
-      # 1日騰落率（open→latest）。post/stat はここだけが書く
       - name: Compute 1d percent & write posts
         env:
           INDEX_KEY: ${{ env.INDEX_KEY }}
@@ -69,9 +59,12 @@ jobs:
           set -e
           python scripts/ain10_pct_post.py \
             --index-key "${INDEX_KEY}" \
-            --csv       "docs/outputs/${INDEX_KEY}_1d.csv" \
-            --out-json  "docs/outputs/${INDEX_KEY}_stats.json" \
-            --out-text  "docs/outputs/${INDEX_KEY}_post_intraday.txt"
+            --csv "docs/outputs/${INDEX_KEY}_1d.csv" \
+            --out-json "docs/outputs/${INDEX_KEY}_stats.json" \
+            --out-text "docs/outputs/${INDEX_KEY}_post_intraday.txt"
+          echo "---- stat/post preview ----"
+          tail -n +1 docs/outputs/${INDEX_KEY}_stats.json || true
+          tail -n +1 docs/outputs/${INDEX_KEY}_post_intraday.txt || true
 
       - name: Upload artifacts (for debug)
         if: always()
@@ -96,8 +89,8 @@ jobs:
           git add docs/outputs/${{ env.INDEX_KEY }}_1m.csv || true
           git add docs/outputs/${{ env.INDEX_KEY }}_1y.csv || true
 
-          git add docs/outputs/${{ env.INDEX_KEY }}_post_intraday.txt || true
           git add docs/outputs/${{ env.INDEX_KEY }}_stats.json || true
+          git add docs/outputs/${{ env.INDEX_KEY }}_post_intraday.txt || true
 
           if git diff --cached --quiet; then
             echo "No chart/stat updates."
