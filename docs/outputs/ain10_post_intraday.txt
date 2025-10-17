@@ -1,1 +1,1 @@
-AIN10 1d: A%=N/A (basis=open valid=2025-10-16 first->latest)
+AIN10 1d: A%=N/A (basis=n/a valid=n/a)
