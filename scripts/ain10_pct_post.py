@@ -1,91 +1,90 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import argparse, json
+import argparse, json, re
 from pathlib import Path
 import pandas as pd
-from typing import Optional
-
-EPS = 1e-6
-MINUTES_AFTER_OPEN = 30  # 最初の30分はノイズ扱い
 
 def iso_now() -> str:
-    """UTCのISO8601(Z付き)"""
-    return pd.Timestamp.now(tz="UTC").isoformat().replace("+00:00", "Z")
+    """UTC ISO8601（Z付き）"""
+    ts = pd.Timestamp.utcnow()
+    ts = ts.tz_localize("UTC") if ts.tzinfo is None else ts.tz_convert("UTC")
+    return ts.isoformat().replace("+00:00", "Z")
 
-def read_1d(csv_path: Path) -> pd.DataFrame:
-    df = pd.read_csv(csv_path)
+def load_csv(path: Path) -> pd.DataFrame:
+    df = pd.read_csv(path)
     if df.shape[1] < 2:
-        raise ValueError(f"CSV must have >= 2 columns: {csv_path}")
+        raise ValueError(f"CSV must have >= 2 columns: {path}")
+    # 先頭2列を ts/val に寄せるのは 1d 用。intraday は後で列探索。
+    return df
+
+def read_1d(csv_1d: Path) -> tuple[float | None, str]:
+    """1d の Δlevel と有効区間メモを返す"""
+    df = load_csv(csv_1d).copy()
     ts_col, val_col = df.columns[:2]
     df = df.rename(columns={ts_col: "ts", val_col: "val"})
     df["ts"] = pd.to_datetime(df["ts"], utc=False, errors="coerce")
     df = df.dropna(subset=["ts", "val"]).sort_values("ts").reset_index(drop=True)
-    return df
-
-def find_stable_open(df: pd.DataFrame) -> tuple[Optional[float], str]:
-    """
-    開始直後ではなく、安定した最初の値を基準にする
-    """
     if df.empty:
         return None, "n/a"
+    first = float(df.iloc[0]["val"])
+    last  = float(df.iloc[-1]["val"])
+    delta = last - first
+    valid = f"{df.iloc[0]['ts']}->{df.iloc[-1]['ts']}"
+    return delta, valid
 
-    t0 = df.iloc[0]["ts"]
-    later = t0 + pd.Timedelta(minutes=MINUTES_AFTER_OPEN)
+def find_pct_column(df: pd.DataFrame) -> str | None:
+    """intraday から % 列を見つける。候補: 'A%', 'pct', 'percent'（大小区別なし/記号含む）"""
+    candidates = [c for c in df.columns]
+    for c in candidates:
+        name = str(c).strip()
+        if re.fullmatch(r"(?i)a%|pct|percent|pct_\d*d?", name.replace(" ", "")):
+            return c
+    # 記号の含まれ方違いにもゆるめに対応
+    for c in candidates:
+        n = str(c).lower()
+        if "a%" in n or "pct" in n or "percent" in n:
+            return c
+    return None
 
-    # 開始30分以降の最初の値を使う（なければ中央値）
-    m = df["ts"] >= later
-    if m.any():
-        val = float(df[m].iloc[0]["val"])
-        ts = pd.to_datetime(df[m].iloc[0]["ts"])
-        return val, f"stable@{ts.strftime('%H:%M')}"
-    else:
-        # 開始から終了までの中央値（全体の中間値）を採用
-        median_row = df.iloc[len(df)//2]
-        return float(median_row["val"]), f"median@{pd.to_datetime(median_row['ts']).strftime('%H:%M')}"
+def read_intraday_pct(csv_intraday: Path) -> tuple[float | None, str]:
+    """
+    intraday の % 列（open→latest の累積％）をそのまま採用。
+    見つからなければ None を返す。
+    """
+    df = load_csv(csv_intraday).copy()
+    # タイムスタンプ列を推定（先頭列が日時の前提）
+    ts_col = df.columns[0]
+    df[ts_col] = pd.to_datetime(df[ts_col], utc=False, errors="coerce")
+    df = df.dropna(subset=[ts_col]).sort_values(ts_col).reset_index(drop=True)
 
-def percent_change(first: float, last: float) -> Optional[float]:
-    try:
-        if first is None or last is None:
-            return None
-        if pd.isna(first) or pd.isna(last):
-            return None
-        if abs(float(first)) < EPS:
-            return None
-        return (float(last) - float(first)) / abs(float(first)) * 100.0
-    except Exception:
-        return None
+    pct_col = find_pct_column(df)
+    if pct_col is None:
+        return None, "no_pct_col"
+    # 最後に有効な％
+    last_valid = pd.to_numeric(df[pct_col], errors="coerce").dropna()
+    if last_valid.empty:
+        return None, "pct_all_nan"
+    pct_last = float(last_valid.iloc[-1])
+    return pct_last, f"from:{pct_col}"
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--index-key", required=True)
-    ap.add_argument("--csv", required=True, help="docs/outputs/*_1d.csv")
+    ap.add_argument("--csv-1d", required=True, help="docs/outputs/*_1d.csv")
+    ap.add_argument("--csv-intraday", required=True, help="docs/outputs/*_intraday.csv")
     ap.add_argument("--out-json", required=True)
     ap.add_argument("--out-text", required=True)
-    ap.add_argument("--basis", choices=["open", "prev_close"], default="open")
-    ap.add_argument("--history", required=False)
     args = ap.parse_args()
 
-    df = read_1d(Path(args.csv))
+    # 1) Δlevel（1dから）
+    delta_level, valid_note = read_1d(Path(args.csv_1d))
 
-    pct_val: Optional[float] = None
-    delta_level: Optional[float] = None
-    basis_note = "n/a"
-    valid_note = "n/a"
+    # 2) 騰落率 %（intraday の % 列をそのまま）
+    pct_val, basis_note = read_intraday_pct(Path(args.csv_intraday))
 
-    if not df.empty:
-        first_row = df.iloc[0]
-        last_row  = df.iloc[-1]
-        last_val  = float(last_row["val"])
-        valid_note = f"{first_row['ts']}->{last_row['ts']}"
-
-        base_val, base_note = find_stable_open(df)
-        basis_note = base_note
-
-        delta_level = last_val - float(first_row["val"])
-        pct_val = percent_change(base_val, last_val)
-
-    pct_str   = "N/A" if pct_val is None else f"{pct_val:+.2f}%"
+    # --- TXT 出力
+    pct_str   = "N/A" if pct_val   is None else f"{pct_val:+.2f}%"
     delta_str = "N/A" if delta_level is None else f"{delta_level:+.6f}"
     text = (
         f"{args.index_key.upper()} 1d: Δ={delta_str} (level) "
@@ -93,6 +92,7 @@ def main():
     )
     Path(args.out_text).write_text(text, encoding="utf-8")
 
+    # --- JSON 出力
     payload = {
         "index_key": args.index_key,
         "pct_1d": None if pct_val is None else float(pct_val),
