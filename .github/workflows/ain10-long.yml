@@ -3,7 +3,7 @@ name: Generate long-term charts (1d/7d/1m/1y + stats + intraday)
 on:
   workflow_dispatch:
   schedule:
-    # UTC
+    # UTC。必要に応じて調整（例: 毎日 20:15 UTC）
     - cron: "15 20 * * *"
 
 permissions:
@@ -19,7 +19,7 @@ env:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 15
 
     steps:
       - name: Checkout
@@ -45,7 +45,7 @@ jobs:
             pip install pandas numpy matplotlib
           fi
 
-      # 1d/7d/1m/1y の画像・CSVなどを docs/outputs に生成
+      # --- チャート生成（1d/7d/1m/1y、画像やCSVを docs/outputs に出力）---
       - name: Generate long-term charts
         env:
           INDEX_KEY: ${{ env.INDEX_KEY }}
@@ -55,20 +55,20 @@ jobs:
           echo "---- LIST AFTER CHARTS ----"
           ls -al docs/outputs || true
 
-      # 前日終値を基準に 1日騰落率を計算。history が無い/0付近の場合は安全にフォールバック
-      - name: Compute 1d percent & write posts
+      # --- 1日騰落率（intraday の % 列を採用） + Δlevel を算出して出力 ---
+      - name: Compute 1d percent & write posts (from intraday %)
         env:
           INDEX_KEY: ${{ env.INDEX_KEY }}
         run: |
           set -e
           python scripts/ain10_pct_post.py \
             --index-key "${INDEX_KEY}" \
-            --csv      "docs/outputs/${INDEX_KEY}_1d.csv" \
-            --history  "docs/outputs/${INDEX_KEY}_history.csv" \
-            --basis    "prev_close" \
+            --csv-1d "docs/outputs/${INDEX_KEY}_1d.csv" \
+            --csv-intraday "docs/outputs/${INDEX_KEY}_intraday.csv" \
             --out-json "docs/outputs/${INDEX_KEY}_stats.json" \
             --out-text "docs/outputs/${INDEX_KEY}_post_intraday.txt"
 
+      # （必要なら）成果物をアーティファクトとして保存
       - name: Upload artifacts (for debug)
         if: always()
         uses: actions/upload-artifact@v4
@@ -76,33 +76,29 @@ jobs:
           name: outputs
           path: docs/outputs
 
+      # --- 生成物のコミット ---
       - name: Commit charts if changed
         run: |
           set -e
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          # images
+          # 画像（1d/7d/1m/1y）
           git add docs/outputs/${{ env.INDEX_KEY }}_1d.png || true
           git add docs/outputs/${{ env.INDEX_KEY }}_7d.png || true
           git add docs/outputs/${{ env.INDEX_KEY }}_1m.png || true
           git add docs/outputs/${{ env.INDEX_KEY }}_1y.png || true
-          git add docs/outputs/${{ env.INDEX_KEY }}_intraday.png || true
 
-          # csv
+          # CSV
           git add docs/outputs/${{ env.INDEX_KEY }}_1d.csv || true
           git add docs/outputs/${{ env.INDEX_KEY }}_7d.csv || true
           git add docs/outputs/${{ env.INDEX_KEY }}_1m.csv || true
           git add docs/outputs/${{ env.INDEX_KEY }}_1y.csv || true
           git add docs/outputs/${{ env.INDEX_KEY }}_intraday.csv || true
-          git add docs/outputs/${{ env.INDEX_KEY }}_history.csv || true
 
-          # posts & stats
-          git add docs/outputs/${{ env.INDEX_KEY }}_stats.json || true
-          git add docs/outputs/${{ env.INDEX_KEY }}_post.txt || true
+          # 投稿テキスト・統計
           git add docs/outputs/${{ env.INDEX_KEY }}_post_intraday.txt || true
-          git add docs/outputs/${{ env.INDEX_KEY }}_intraday_post.txt || true
-          git add docs/outputs/${{ env.INDEX_KEY }}_post_*.txt || true
+          git add docs/outputs/${{ env.INDEX_KEY }}_stats.json || true
 
           if git diff --cached --quiet; then
             echo "No chart/stat updates."
