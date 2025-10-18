@@ -8,9 +8,8 @@ import pandas as pd
 INDEX_KEY_DEFAULT = "ain10"
 OUT_DIR = Path("docs/outputs")
 
-# 騰落率ロジック（long_charts/ain10_pct_post と揃える）
 EPS = 5.0
-CLAMP_PCT = 100.0
+CLAMP_PCT = 30.0
 
 def read_intraday(csv_path: Path) -> pd.DataFrame:
     df = pd.read_csv(csv_path)
@@ -23,7 +22,6 @@ def read_intraday(csv_path: Path) -> pd.DataFrame:
     return df
 
 def choose_baseline(df_day: pd.DataFrame) -> tuple[float | None, str]:
-    """open→10:00以降安定→|val|>=EPS→最初の値 の順で基準を決める"""
     if df_day.empty:
         return None, "no_pct_col"
     open_val = float(df_day.iloc[0]["val"])
@@ -40,8 +38,6 @@ def choose_baseline(df_day: pd.DataFrame) -> tuple[float | None, str]:
 
 def percent_change(first: float, last: float) -> float | None:
     try:
-        if first is None or last is None:
-            return None
         denom = max(abs(float(first)), abs(float(last)), EPS)
         pct = (float(last) - float(first)) / denom * 100.0
         if pct > CLAMP_PCT:
@@ -64,7 +60,6 @@ def main():
         Path(args.out_text).write_text(f"{args.index_key.upper()} intraday: (no data)\n", encoding="utf-8")
         return
 
-    # 当日データ
     day = df["ts"].dt.floor("D").iloc[-1]
     df_day = df[df["ts"].dt.floor("D") == day]
     if df_day.empty:
@@ -73,7 +68,7 @@ def main():
 
     base, basis_note = choose_baseline(df_day)
     first_ts = df_day.iloc[0]["ts"]
-    last_ts = df_day.iloc[-1]["ts"]
+    last_ts  = df_day.iloc[-1]["ts"]
     last_val = float(df_day.iloc[-1]["val"])
 
     delta_level = last_val - float(base)
@@ -81,11 +76,7 @@ def main():
 
     pct_str = "N/A" if pct_val is None else f"{pct_val:+.2f}%"
     delta_str = f"{delta_level:+.6f}"
-
-    text = (
-        f"{args.index_key.upper()} 1d: Δ={delta_str} (level) "
-        f"A%={pct_str} (basis={basis_note} valid={first_ts}->{last_ts})\n"
-    )
+    text = f"{args.index_key.upper()} 1d: Δ={delta_str} (level) A%={pct_str} (basis={basis_note} valid={first_ts}->{last_ts})\n"
     Path(args.out_text).write_text(text, encoding="utf-8")
 
 if __name__ == "__main__":
