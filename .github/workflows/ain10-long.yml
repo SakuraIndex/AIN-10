@@ -51,7 +51,7 @@ jobs:
           print("Matplotlib:", getattr(matplotlib, "__version__", "n/a"))
           PY
 
-      # ───────── ここから長期チャート ─────────
+      # ───────── 長期チャート生成 ─────────
       - name: DIAG • Check files before plotting
         run: |
           set -euxo pipefail
@@ -76,7 +76,7 @@ jobs:
           echo "=== ls -la docs/outputs (after) ==="
           ls -la docs/outputs || true
 
-      # ───────── 1d 騰落率（安定基準） ─────────
+      # ───────── 1d 騰落率（自動基準: open or stable@10:00） ─────────
       - name: Compute 1d percent & write posts
         run: |
           set -euxo pipefail
@@ -86,11 +86,11 @@ jobs:
             --csv "${OUT_DIR}/${INDEX_KEY}_1d.csv" \
             --out-json "${OUT_DIR}/${INDEX_KEY}_stats.json" \
             --out-text "${OUT_DIR}/${INDEX_KEY}_post_intraday.txt" \
-            --basis stable@10:00
+            --basis auto
           echo "=== MARKER: pct_post finished ==="
-          echo "--- ain10_post_intraday.txt ---"
+          echo "--- ${INDEX_KEY}_post_intraday.txt ---"
           sed -n '1p' "${OUT_DIR}/${INDEX_KEY}_post_intraday.txt" || true
-          echo "--- ain10_stats.json ---"
+          echo "--- ${INDEX_KEY}_stats.json ---"
           head -c 400 "${OUT_DIR}/${INDEX_KEY}_stats.json" || true
           echo
 
