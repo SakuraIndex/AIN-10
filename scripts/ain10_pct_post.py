@@ -1,90 +1,125 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import argparse, json, re
+import argparse, json
 from pathlib import Path
 import pandas as pd
+from typing import Optional, Tuple
 
+# ---------- 時刻ユーティリティ ----------
 def iso_now() -> str:
-    """UTC ISO8601（Z付き）"""
+    """常にUTCのISO8601（Z付き）を返す。"""
     ts = pd.Timestamp.utcnow()
-    ts = ts.tz_localize("UTC") if ts.tzinfo is None else ts.tz_convert("UTC")
+    ts = ts.tz_convert("UTC") if ts.tzinfo is not None else ts.tz_localize("UTC")
     return ts.isoformat().replace("+00:00", "Z")
 
-def load_csv(path: Path) -> pd.DataFrame:
-    df = pd.read_csv(path)
+# ---------- 入力読み込み ----------
+def read_1d(csv_path: Path) -> pd.DataFrame:
+    """
+    docs/outputs/ain10_1d.csv を読み込み、先頭2列を ts/val に正規化。
+    """
+    df = pd.read_csv(csv_path)
     if df.shape[1] < 2:
-        raise ValueError(f"CSV must have >= 2 columns: {path}")
-    # 先頭2列を ts/val に寄せるのは 1d 用。intraday は後で列探索。
-    return df
-
-def read_1d(csv_1d: Path) -> tuple[float | None, str]:
-    """1d の Δlevel と有効区間メモを返す"""
-    df = load_csv(csv_1d).copy()
+        raise ValueError(f"CSV must have >= 2 columns: {csv_path}")
     ts_col, val_col = df.columns[:2]
     df = df.rename(columns={ts_col: "ts", val_col: "val"})
     df["ts"] = pd.to_datetime(df["ts"], utc=False, errors="coerce")
     df = df.dropna(subset=["ts", "val"]).sort_values("ts").reset_index(drop=True)
-    if df.empty:
-        return None, "n/a"
-    first = float(df.iloc[0]["val"])
-    last  = float(df.iloc[-1]["val"])
-    delta = last - first
-    valid = f"{df.iloc[0]['ts']}->{df.iloc[-1]['ts']}"
-    return delta, valid
+    return df
 
-def find_pct_column(df: pd.DataFrame) -> str | None:
-    """intraday から % 列を見つける。候補: 'A%', 'pct', 'percent'（大小区別なし/記号含む）"""
-    candidates = [c for c in df.columns]
-    for c in candidates:
-        name = str(c).strip()
-        if re.fullmatch(r"(?i)a%|pct|percent|pct_\d*d?", name.replace(" ", "")):
-            return c
-    # 記号の含まれ方違いにもゆるめに対応
-    for c in candidates:
-        n = str(c).lower()
-        if "a%" in n or "pct" in n or "percent" in n:
-            return c
-    return None
-
-def read_intraday_pct(csv_intraday: Path) -> tuple[float | None, str]:
+# ---------- 基準値の決定 ----------
+def pick_baseline(
+    df: pd.DataFrame,
+    basis: str,
+    min_abs_for_pct: float = 0.3,
+) -> Tuple[Optional[float], str]:
     """
-    intraday の % 列（open→latest の累積％）をそのまま採用。
-    見つからなければ None を返す。
+    騰落率の分母となる基準値と、basis 注記文字列を返す。
+    - "open"        : 一番最初の値
+    - "prev_close"  : 今は open と同じ扱い（将来差し替え可）
+    - "stable@HH:MM": 指定時刻以降で最初の非ゼロ（|val|>1e-9）の値
+    戻り値: (baseline, basis_note)
     """
-    df = load_csv(csv_intraday).copy()
-    # タイムスタンプ列を推定（先頭列が日時の前提）
-    ts_col = df.columns[0]
-    df[ts_col] = pd.to_datetime(df[ts_col], utc=False, errors="coerce")
-    df = df.dropna(subset=[ts_col]).sort_values(ts_col).reset_index(drop=True)
+    note = basis
+    first_val = float(df.iloc[0]["val"])
 
-    pct_col = find_pct_column(df)
-    if pct_col is None:
-        return None, "no_pct_col"
-    # 最後に有効な％
-    last_valid = pd.to_numeric(df[pct_col], errors="coerce").dropna()
-    if last_valid.empty:
-        return None, "pct_all_nan"
-    pct_last = float(last_valid.iloc[-1])
-    return pct_last, f"from:{pct_col}"
+    if basis.startswith("stable@"):
+        try:
+            hhmm = basis.split("@", 1)[1]
+            hh, mm = map(int, hhmm.split(":"))
+        except Exception:
+            # フォーマット不正なら open にフォールバック
+            return first_val, "open(fallback)"
 
+        # 指定時刻以降の最初の非ゼロ（または最初に |val| が 1e-9 を超える点）
+        t0 = df["ts"].dt.normalize().iloc[0] + pd.Timedelta(hours=hh, minutes=mm)
+        sub = df[df["ts"] >= t0]
+        base_row = sub[abs(sub["val"]) > 1e-9].head(1)
+        if base_row.empty:
+            # 見つからなければ、全期間の最初の非ゼロを使う
+            base_row = df[abs(df["val"]) > 1e-9].head(1)
+            note = f"stable@{hhmm}(fallback-first-nonzero)"
+        if base_row.empty:
+            # それでもなければ open
+            return first_val, f"stable@{hhmm}(fallback-open)"
+        base_val = float(base_row["val"].iloc[0])
+        note = f"stable@{hhmm}"
+    elif basis == "open":
+        base_val = first_val
+        note = "open"
+    elif basis == "prev_close":
+        # 今回はデータが無いので open と同じ
+        base_val = first_val
+        note = "prev_close(open)"
+    else:
+        # 未知指定は open
+        base_val = first_val
+        note = "open(unknown-basis)"
+
+    # 分母が小さすぎると % が暴れるので抑止
+    if abs(base_val) < min_abs_for_pct:
+        return None, "no_pct_col"  # 理由を note に入れておく
+
+    return base_val, note
+
+# ---------- % 計算 ----------
+def percent_change(base: float, last: float) -> Optional[float]:
+    """((last - base) / |base|) * 100"""
+    try:
+        return (float(last) - float(base)) / abs(float(base)) * 100.0
+    except Exception:
+        return None
+
+# ---------- メイン ----------
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--index-key", required=True)
-    ap.add_argument("--csv-1d", required=True, help="docs/outputs/*_1d.csv")
-    ap.add_argument("--csv-intraday", required=True, help="docs/outputs/*_intraday.csv")
+    ap.add_argument("--csv", required=True, help="docs/outputs/*_1d.csv")
     ap.add_argument("--out-json", required=True)
     ap.add_argument("--out-text", required=True)
+    # open / prev_close / stable@HH:MM
+    ap.add_argument("--basis", default="stable@10:00")
     args = ap.parse_args()
 
-    # 1) Δlevel（1dから）
-    delta_level, valid_note = read_1d(Path(args.csv_1d))
+    df = read_1d(Path(args.csv))
+    pct_val: Optional[float] = None
+    delta_level: Optional[float] = None
+    basis_note = "n/a"
+    valid_note = "n/a"
 
-    # 2) 騰落率 %（intraday の % 列をそのまま）
-    pct_val, basis_note = read_intraday_pct(Path(args.csv_intraday))
+    if not df.empty:
+        first_row = df.iloc[0]
+        last_row = df.iloc[-1]
+        last_val = float(last_row["val"])
+        delta_level = last_val - float(first_row["val"])
+        valid_note = f"{first_row['ts']}->{last_row['ts']}"
 
-    # --- TXT 出力
-    pct_str   = "N/A" if pct_val   is None else f"{pct_val:+.2f}%"
+        base_val, basis_note = pick_baseline(df, args.basis)
+        if base_val is not None:
+            pct_val = percent_change(base_val, last_val)
+
+    # --- TXT ---
+    pct_str = "N/A" if pct_val is None else f"{pct_val:+.2f}%"
     delta_str = "N/A" if delta_level is None else f"{delta_level:+.6f}"
     text = (
         f"{args.index_key.upper()} 1d: Δ={delta_str} (level) "
@@ -92,7 +127,7 @@ def main():
     )
     Path(args.out_text).write_text(text, encoding="utf-8")
 
-    # --- JSON 出力
+    # --- JSON ---
     payload = {
         "index_key": args.index_key,
         "pct_1d": None if pct_val is None else float(pct_val),
