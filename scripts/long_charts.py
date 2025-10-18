@@ -8,148 +8,127 @@ import matplotlib.pyplot as plt
 from matplotlib.ticker import MaxNLocator, FuncFormatter
 from matplotlib.dates import AutoDateLocator, AutoDateFormatter
 
-# ── settings ──────────────────────────────────────────────────────────────
 INDEX_KEY = os.environ.get("INDEX_KEY", "ain10")
 OUT_DIR = Path("docs/outputs")
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
-# %基準の検出パラメータ（1dのみ使用）
-PCT_MIN_ABS_BASE = 0.10        # 基準の最小絶対値
-PCT_SEARCH_FROM  = "09:35"     # この時刻以降で最初の十分大きい値を基準にする
+PCT_MODE_1D = True  # 1d のみ％表示に変換（7d/1m/1y は従来どおり level）
 
-# ── theme ─────────────────────────────────────────────────────────────────
+# ---- Dark style（枠線なし・落ち着いたグリッド）
 def apply_dark_theme(fig, ax):
-    """黒ベース・枠線なし・落ち着いたグリッド"""
     ax.set_facecolor("#111317")
     fig.patch.set_facecolor("#111317")
-
-    for spine in ax.spines.values():
-        spine.set_visible(False)
-
+    for s in ax.spines.values():
+        s.set_visible(False)
     ax.tick_params(colors="#cfd3dc", labelsize=10)
     ax.yaxis.label.set_color("#cfd3dc")
     ax.xaxis.label.set_color("#cfd3dc")
     ax.title.set_color("#e7ebf3")
-
     ax.grid(True, which="major", linestyle="-", linewidth=0.6, alpha=0.18, color="#ffffff")
     ax.grid(True, which="minor", linestyle="-", linewidth=0.4, alpha=0.10, color="#ffffff")
 
-# ── io ────────────────────────────────────────────────────────────────────
 def load_csv(csv_path: Path) -> pd.DataFrame:
     df = pd.read_csv(csv_path)
     if df.shape[1] < 2:
         raise ValueError(f"CSV needs >=2 columns: {csv_path}")
-
-    ts_col = df.columns[0]
-    val_col = df.columns[1]
+    ts_col, val_col = df.columns[:2]
     df = df.rename(columns={ts_col: "ts", val_col: "val"})
     df["ts"] = pd.to_datetime(df["ts"], utc=False, errors="coerce")
     df = df.dropna(subset=["ts", "val"]).sort_values("ts").reset_index(drop=True)
     return df
 
-# ── helpers ──────────────────────────────────────────────────────────────
 def subset_for_span(df: pd.DataFrame, span: str) -> pd.DataFrame:
-    if df.empty:
-        return df
     if span == "1d":
         last_day = df["ts"].dt.floor("D").max()
         return df[df["ts"].dt.floor("D") == last_day]
-    last = df["ts"].max()
-    if span == "7d":
-        return df[df["ts"] >= (last - pd.Timedelta(days=7))]
-    if span == "1m":
-        return df[df["ts"] >= (last - pd.Timedelta(days=30))]
-    if span == "1y":
-        return df[df["ts"] >= (last - pd.Timedelta(days=365))]
+    elif span == "7d":
+        end = df["ts"].max()
+        return df[df["ts"] >= (end - pd.Timedelta(days=7))]
+    elif span == "1m":
+        end = df["ts"].max()
+        return df[df["ts"] >= (end - pd.Timedelta(days=30))]
+    elif span == "1y":
+        end = df["ts"].max()
+        return df[df["ts"] >= (end - pd.Timedelta(days=365))]
     return df
 
-def to_percent_series_1d(df: pd.DataFrame) -> tuple[pd.Series | None, str]:
-    """
-    1dの値を%, 基準は:
-      - 当日 09:35 以降で最初の |val| >= PCT_MIN_ABS_BASE
-      - なければ先頭値が十分大きければそれを使用
-      - どちらも満たさなければ None を返して level 表示にフォールバック
-    """
+def pick_10am_value(df: pd.DataFrame) -> float | None:
     if df.empty:
-        return None, "n/a"
-
+        return None
     day = df["ts"].dt.floor("D").max()
-    start = pd.Timestamp(f"{day.date()} {PCT_SEARCH_FROM}")
-    cand = df[df["ts"] >= start]
-    cand = cand[cand["val"].abs() >= PCT_MIN_ABS_BASE]
+    target = day + pd.Timedelta(hours=10)
+    window = (df["ts"] >= target - pd.Timedelta(minutes=5)) & (df["ts"] <= target + pd.Timedelta(minutes=5))
+    cand = df.loc[window]
+    if cand.empty:
+        return None
+    i = (cand["ts"] - target).abs().idxmin()
+    return float(cand.loc[i, "val"])
 
-    if not cand.empty:
-        base = float(cand.iloc[0]["val"])
-        basis_note = f"first_nonzero@{PCT_SEARCH_FROM}"
+def transform_to_pct_1d(df: pd.DataFrame) -> tuple[pd.DataFrame, str]:
+    """1d を % に変換（分母は stable@10:00 → fallback: median_abs@1d）"""
+    basis = "n/a"
+    if df.empty:
+        return df.copy(), basis
+    denom = pick_10am_value(df)
+    if denom is not None and abs(denom) >= 1e-3:
+        basis = "stable@10:00"
+        base_ref = denom
     else:
-        base = float(df.iloc[0]["val"])
-        if abs(base) < PCT_MIN_ABS_BASE:
-            return None, "no_pct_col"
-        basis_note = "open"
+        med_abs = float(df["val"].abs().median())
+        if med_abs > 1e-6:
+            basis = "median_abs@1d"
+            base_ref = df.iloc[0]["val"]  # 実線の中心は初値近傍、分母は中央値
+            denom = med_abs
+        else:
+            return df.copy(), "n/a"
 
-    pct = (df["val"].astype(float) - base) / abs(base) * 100.0
-    return pct, basis_note
+    out = df.copy()
+    out["val"] = (out["val"] - base_ref) / max(abs(denom), 1e-6) * 100.0
+    return out, basis
 
-# ── plotting ─────────────────────────────────────────────────────────────
-def plot_one_span(df: pd.DataFrame, title: str, out_png: Path, span: str):
+def plot_one_span(df: pd.DataFrame, span: str, out_png: Path):
+    title = f"{INDEX_KEY.upper()} ({span})"
+
+    # 1d だけ％変換
+    y_label = "Index (level)"
+    if span == "1d" and PCT_MODE_1D:
+        df, basis = transform_to_pct_1d(df)
+        y_label = "Change (%)"
+        title += "" if basis == "n/a" else f" – {basis}"
+
     fig, ax = plt.subplots(figsize=(16, 8), dpi=110)
     apply_dark_theme(fig, ax)
+    ax.set_title(title, fontsize=26, fontweight="bold", pad=18)
+    ax.set_xlabel("Time", labelpad=10)
+    ax.set_ylabel(y_label, labelpad=10)
 
-    if span == "1d":
-        y, basis = to_percent_series_1d(df)
-        if y is not None:
-            ax.set_title(title, fontsize=26, fontweight="bold", pad=18)
-            ax.set_xlabel("Time", labelpad=10)
-            ax.set_ylabel("Change (%)", labelpad=10)
-            ax.plot(df["ts"].values, y.values, linewidth=2.6, color="#ff615a")
-            ax.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:.0f}%"))
-        else:
-            # 基準が取れない日は level 表示でフォールバック
-            ax.set_title(title, fontsize=26, fontweight="bold", pad=18)
-            ax.set_xlabel("Time", labelpad=10)
-            ax.set_ylabel("Index (level)", labelpad=10)
-            ax.plot(df["ts"].values, df["val"].values, linewidth=2.6, color="#ff615a")
-    else:
-        ax.set_title(title, fontsize=26, fontweight="bold", pad=18)
-        ax.set_xlabel("Time", labelpad=10)
-        ax.set_ylabel("Index (level)", labelpad=10)
-        ax.plot(df["ts"].values, df["val"].values, linewidth=2.6, color="#ff615a")
+    ax.plot(df["ts"].values, df["val"].values, linewidth=2.6, color="#ff615a")
 
-    # X軸：日付ロケータ/フォーマッタ
+    # x 軸：日付ロケータ/フォーマッタ
     major = AutoDateLocator(minticks=5, maxticks=10)
     ax.xaxis.set_major_locator(major)
     ax.xaxis.set_major_formatter(AutoDateFormatter(major))
     ax.xaxis.set_minor_locator(MaxNLocator(nbins=50))
 
+    # y 軸：1d が％のときは % 表示
+    if span == "1d" and PCT_MODE_1D:
+        ax.yaxis.set_major_formatter(FuncFormatter(lambda v, p: f"{v:.0f}%"))
+
     fig.tight_layout()
     fig.savefig(out_png, facecolor=fig.get_facecolor())
     plt.close(fig)
 
-# ── main ─────────────────────────────────────────────────────────────────
 def main():
-    spans = ["1d", "7d", "1m", "1y"]
-    print("[MARKER] long_charts.py started")
-
-    for span in spans:
+    for span in ["1d", "7d", "1m", "1y"]:
         csv = OUT_DIR / f"{INDEX_KEY}_{span}.csv"
         if not csv.exists():
             continue
-
-        df = load_csv(csv)
-        df_span = subset_for_span(df, span)
-        rows = len(df_span)
-        if rows == 0:
+        df_all = load_csv(csv)
+        df = subset_for_span(df_all, span)
+        if df.empty:
             continue
-
-        ts_min = df_span["ts"].min()
-        ts_max = df_span["ts"].max()
-
         out_png = OUT_DIR / f"{INDEX_KEY}_{span}.png"
-        print(f"[MARKER] plotting span={span} rows={rows} ts_min={ts_min} ts_max={ts_max} -> {out_png}")
-        plot_one_span(df_span, f"{INDEX_KEY.upper()} ({span})", out_png, span)
-        print(f"[MARKER] saved figure: {out_png}")
-
-    print("=== MARKER: long_charts finished ===")
+        plot_one_span(df, span, out_png)
 
 if __name__ == "__main__":
     main()
