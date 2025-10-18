@@ -12,39 +12,32 @@ INDEX_KEY = os.environ.get("INDEX_KEY", "ain10")
 OUT_DIR = Path("docs/outputs")
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
-# 騰落率の安定化パラメータ
-EPS = 5.0            # 分母の下限（小さすぎる値で暴発しないよう底上げ）
-CLAMP_PCT = 100.0    # 最終クリップ（±100%を上限に）
+# 騰落率の安定化
+EPS = 5.0          # 分母の下限
+CLAMP_PCT = 30.0   # 仕上がりの上限（±30%）←大きすぎる印象を確実に排除
 
-# ---- ダークテーマ + 軸文字「完全白」統一 ----
 def apply_dark_theme(fig, ax):
     fig.patch.set_facecolor("#111317")
     ax.set_facecolor("#111317")
-
-    # 枠線消し
     for spine in ax.spines.values():
         spine.set_visible(False)
-
-    # まず一括で白
+    # 文字は完全白に統一
     ax.tick_params(axis="both", colors="#ffffff", labelsize=10)
     ax.yaxis.label.set_color("#ffffff")
     ax.xaxis.label.set_color("#ffffff")
     ax.title.set_color("#ffffff")
-
-    # グリッドは白系
+    # グリッド
     ax.grid(True, which="major", linestyle="-", linewidth=0.6, alpha=0.18, color="#ffffff")
     ax.grid(True, which="minor", linestyle="-", linewidth=0.4, alpha=0.10, color="#ffffff")
 
 def force_all_white(ax):
-    """他の設定に上書きされても最終的に文字が白になるよう強制"""
     ax.tick_params(axis="both", colors="#ffffff")
-    for tick in ax.get_xticklabels() + ax.get_yticklabels():
-        tick.set_color("#ffffff")
+    for t in ax.get_xticklabels() + ax.get_yticklabels():
+        t.set_color("#ffffff")
     ax.xaxis.label.set_color("#ffffff")
     ax.yaxis.label.set_color("#ffffff")
     ax.title.set_color("#ffffff")
 
-# ---- CSV 読み込み ----
 def load_csv(csv_path: Path) -> pd.DataFrame:
     df = pd.read_csv(csv_path)
     if df.shape[1] < 2:
@@ -55,7 +48,6 @@ def load_csv(csv_path: Path) -> pd.DataFrame:
     df = df.dropna(subset=["ts", "val"]).sort_values("ts").reset_index(drop=True)
     return df
 
-# ---- 基準点選択 ----
 def stable_baseline(df_day: pd.DataFrame) -> float | None:
     if df_day.empty:
         return None
@@ -68,7 +60,6 @@ def stable_baseline(df_day: pd.DataFrame) -> float | None:
         return float(cand2.iloc[0]["val"])
     return float(df_day.iloc[0]["val"])  # 最終フォールバック
 
-# ---- 騰落率計算 ----
 def calc_sane_pct(base: float, close: float) -> float:
     try:
         denom = max(abs(base), abs(close), EPS)
@@ -81,11 +72,9 @@ def calc_sane_pct(base: float, close: float) -> float:
     except Exception:
         return 0.0
 
-# ---- パーセント系列化 ----
 def make_pct_series(df: pd.DataFrame, span: str) -> pd.DataFrame:
     if df.empty:
         return df
-
     if span == "1d":
         the_day = df["ts"].dt.floor("D").iloc[-1]
         df_day = df[df["ts"].dt.floor("D") == the_day].copy()
@@ -93,7 +82,7 @@ def make_pct_series(df: pd.DataFrame, span: str) -> pd.DataFrame:
             return df_day
         base = stable_baseline(df_day)
         if base is None:
-            return pd.DataFrame()
+            return Path()
         df_day["pct"] = df_day["val"].apply(lambda x: calc_sane_pct(base, x))
         return df_day
     else:
@@ -106,31 +95,23 @@ def make_pct_series(df: pd.DataFrame, span: str) -> pd.DataFrame:
         df_span["pct"] = df_span["val"].apply(lambda x: calc_sane_pct(base, x))
         return df_span
 
-# ---- 描画 ----
 def plot_one_span(df_pct: pd.DataFrame, title: str, out_png: Path):
     fig, ax = plt.subplots(figsize=(16, 8), dpi=110)
     apply_dark_theme(fig, ax)
-
     ax.set_title(title, fontsize=26, fontweight="bold", pad=18)
     ax.set_xlabel("Time", labelpad=10)
     ax.set_ylabel("Change (%)", labelpad=10)
-
     ax.plot(df_pct["ts"].values, df_pct["pct"].values, linewidth=2.6, color="#ff615a")
-
     major = AutoDateLocator(minticks=5, maxticks=10)
     ax.xaxis.set_major_locator(major)
     ax.xaxis.set_major_formatter(AutoDateFormatter(major))
     ax.yaxis.set_minor_locator(MaxNLocator(nbins=50))
     ax.yaxis.set_major_locator(MaxNLocator(nbins=7))
-
-    # 最後に白を念押し
-    force_all_white(ax)
-
+    force_all_white(ax)  # 念押し
     fig.tight_layout()
     fig.savefig(out_png, facecolor=fig.get_facecolor())
     plt.close(fig)
 
-# ---- メイン ----
 def main():
     spans = ["1d", "7d", "1m", "1y"]
     for span in spans:
@@ -139,7 +120,7 @@ def main():
             continue
         df = load_csv(csv)
         df_pct = make_pct_series(df, span)
-        if df_pct.empty or "pct" not in df_pct:
+        if isinstance(df_pct, Path) or df_pct is None or df_pct.empty or "pct" not in df_pct:
             continue
         out_png = OUT_DIR / f"{INDEX_KEY}_{span}.png"
         title = f"{INDEX_KEY.upper()} ({span})"
