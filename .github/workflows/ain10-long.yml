@@ -1,32 +1,33 @@
-name: Generate long-term charts (1d/7d/1m/1y + stats + intraday)
+name: AIN-10 • long charts & intraday percent
 
 on:
   workflow_dispatch:
   schedule:
-    # UTC。必要に応じて調整（例: 毎日 20:15 UTC）
-    - cron: "15 20 * * *"
+    # 平日 09:00–17:30 JST の間、10分おき
+    # (= 00:00–08:30 UTC)。必要に応じて調整してください。
+    - cron: "*/10 0-8 * * 1-5"
 
 permissions:
   contents: write
 
 concurrency:
-  group: long-charts-${{ github.ref }}
+  group: ain10-long
   cancel-in-progress: false
 
 env:
   INDEX_KEY: ain10
+  OUT_DIR: docs/outputs
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 10
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          persist-credentials: true
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -35,75 +36,61 @@ jobs:
 
       - name: Install deps
         run: |
-          set -e
           python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then
-            pip install -r requirements.txt
-          elif [ -f src/requirements.txt ]; then
-            pip install -r src/requirements.txt
-          else
-            pip install pandas numpy matplotlib
-          fi
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          # 依存関係確認（デバッグ用）
+          python - <<'PY'
+          import sys, matplotlib
+          print("Py:", sys.version)
+          print("Matplotlib:", matplotlib.__version__)
+          PY
 
-      # --- チャート生成（1d/7d/1m/1y、画像やCSVを docs/outputs に出力）---
+      # ──────────────────────────────────────────────────────────────
+      # 長期チャートの生成（1d/7d/1m/1y）
+      # ※ scripts/long_charts.py はリポジトリ同梱の前提
+      # ──────────────────────────────────────────────────────────────
       - name: Generate long-term charts
-        env:
-          INDEX_KEY: ${{ env.INDEX_KEY }}
         run: |
-          set -e
+          set -euxo pipefail
           python scripts/long_charts.py
-          echo "---- LIST AFTER CHARTS ----"
-          ls -al docs/outputs || true
 
-      # --- 1日騰落率（intraday の % 列を採用） + Δlevel を算出して出力 ---
-      - name: Compute 1d percent & write posts (from intraday %)
-        env:
-          INDEX_KEY: ${{ env.INDEX_KEY }}
+      # ──────────────────────────────────────────────────────────────
+      # 1d 騰落率を算出し、テキスト/JSON を出力
+      #   ・分母は「10:00 以降の最初の非ゼロ」を既定（stable@10:00）
+      #   ・小さすぎる分母は N/A（basis=no_pct_col）
+      # ──────────────────────────────────────────────────────────────
+      - name: Compute 1d percent & write posts
         run: |
-          set -e
+          set -euxo pipefail
           python scripts/ain10_pct_post.py \
             --index-key "${INDEX_KEY}" \
-            --csv-1d "docs/outputs/${INDEX_KEY}_1d.csv" \
-            --csv-intraday "docs/outputs/${INDEX_KEY}_intraday.csv" \
-            --out-json "docs/outputs/${INDEX_KEY}_stats.json" \
-            --out-text "docs/outputs/${INDEX_KEY}_post_intraday.txt"
+            --csv "${OUT_DIR}/${INDEX_KEY}_1d.csv" \
+            --out-json "${OUT_DIR}/${INDEX_KEY}_stats.json" \
+            --out-text "${OUT_DIR}/${INDEX_KEY}_post_intraday.txt" \
+            --basis stable@10:00
 
-      # （必要なら）成果物をアーティファクトとして保存
+      # デバッグ用に生成物をアップロード（任意）
       - name: Upload artifacts (for debug)
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: outputs
-          path: docs/outputs
+          name: ain10-outputs
+          path: |
+            docs/outputs/*.csv
+            docs/outputs/*.png
+            docs/outputs/*post*.txt
+            docs/outputs/*stats*.json
 
-      # --- 生成物のコミット ---
+      # 変更があればコミット
       - name: Commit charts if changed
         run: |
-          set -e
+          set -euxo pipefail
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
-          # 画像（1d/7d/1m/1y）
-          git add docs/outputs/${{ env.INDEX_KEY }}_1d.png || true
-          git add docs/outputs/${{ env.INDEX_KEY }}_7d.png || true
-          git add docs/outputs/${{ env.INDEX_KEY }}_1m.png || true
-          git add docs/outputs/${{ env.INDEX_KEY }}_1y.png || true
-
-          # CSV
-          git add docs/outputs/${{ env.INDEX_KEY }}_1d.csv || true
-          git add docs/outputs/${{ env.INDEX_KEY }}_7d.csv || true
-          git add docs/outputs/${{ env.INDEX_KEY }}_1m.csv || true
-          git add docs/outputs/${{ env.INDEX_KEY }}_1y.csv || true
-          git add docs/outputs/${{ env.INDEX_KEY }}_intraday.csv || true
-
-          # 投稿テキスト・統計
-          git add docs/outputs/${{ env.INDEX_KEY }}_post_intraday.txt || true
-          git add docs/outputs/${{ env.INDEX_KEY }}_stats.json || true
-
-          if git diff --cached --quiet; then
-            echo "No chart/stat updates."
-            exit 0
+          git add -A docs/outputs
+          if ! git diff --cached --quiet; then
+            git commit -m "chore(charts): update ${INDEX_KEY} (1d/7d/1m/1y + stats + intraday)"
+            git push
+          else
+            echo "No changes to commit."
           fi
-
-          git commit -m "chore(charts): update ${{ env.INDEX_KEY }} (1d/7d/1m/1y + stats + intraday)"
-          git push
