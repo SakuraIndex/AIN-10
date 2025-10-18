@@ -12,7 +12,8 @@ INDEX_KEY = os.environ.get("INDEX_KEY", "ain10")
 OUT_DIR = Path("docs/outputs")
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
-EPS = 0.2  # 分母が小さすぎる時の安全域
+# 分母が小さすぎる時の暴発抑制（ain10_pct_post.py と同値）
+EPS = 1.0
 
 # ---- ダークテーマ ----
 def apply_dark_theme(fig, ax):
@@ -20,9 +21,9 @@ def apply_dark_theme(fig, ax):
     fig.patch.set_facecolor("#111317")
     for spine in ax.spines.values():
         spine.set_visible(False)
-    ax.tick_params(colors="#cfd3dc", labelsize=10)
-    ax.yaxis.label.set_color("#cfd3dc")
-    ax.xaxis.label.set_color("#cfd3dc")
+    ax.tick_params(colors="#cfdf3d", labelsize=10)
+    ax.yaxis.label.set_color("#cfdf3d")
+    ax.xaxis.label.set_color("#cfdf3d")
     ax.title.set_color("#e7ebf3")
     ax.grid(True, which="major", linestyle="-", linewidth=0.6, alpha=0.18, color="#ffffff")
     ax.grid(True, which="minor", linestyle="-", linewidth=0.4, alpha=0.10, color="#ffffff")
@@ -38,7 +39,7 @@ def load_csv(csv_path: Path) -> pd.DataFrame:
     return df
 
 def stable_baseline(df_day: pd.DataFrame) -> float | None:
-    """安定した基準値を選ぶ（10:00以降 or 最初の有効値）"""
+    """安定した基準値を選ぶ（10:00以降 / |val|>=EPS、なければ |val|>=EPS の最初、最後は最初の値）"""
     if df_day.empty:
         return None
     mask = (df_day["ts"].dt.hour > 10) | ((df_day["ts"].dt.hour == 10) & (df_day["ts"].dt.minute >= 0))
@@ -48,10 +49,11 @@ def stable_baseline(df_day: pd.DataFrame) -> float | None:
     cand2 = df_day.loc[df_day["val"].abs() >= EPS]
     if not cand2.empty:
         return float(cand2.iloc[0]["val"])
-    return None
+    # 最終fallback：最初の値（条件なし）を返し、発散は calc_sane_pct 側で抑制
+    return float(df_day.iloc[0]["val"])
 
 def calc_sane_pct(base: float, close: float) -> float:
-    """過剰な騰落率を防ぐ安全な%計算"""
+    """過剰な騰落率を防ぐ安全な計算"""
     try:
         denom = max(abs(base), abs(close), EPS)
         return (close - base) / denom * 100.0
@@ -91,7 +93,7 @@ def plot_one_span(df_pct: pd.DataFrame, title: str, out_png: Path):
     major = AutoDateLocator(minticks=5, maxticks=10)
     ax.xaxis.set_major_locator(major)
     ax.xaxis.set_major_formatter(AutoDateFormatter(major))
-    ax.xaxis.set_minor_locator(MaxNLocator(nbins=50))
+    ax.yaxis.set_minor_locator(MaxNLocator(nbins=50))
     ax.yaxis.set_major_locator(MaxNLocator(nbins=7))
     fig.tight_layout()
     fig.savefig(out_png, facecolor=fig.get_facecolor())
