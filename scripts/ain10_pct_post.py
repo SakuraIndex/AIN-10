@@ -6,8 +6,8 @@ import json
 from pathlib import Path
 import pandas as pd
 
-# 小さすぎる分母を避ける閾値（long_charts.py と揃える）
-EPS = 0.2
+# 分母が小さすぎる時の暴発抑制（long_charts.py と同値）
+EPS = 1.0
 
 def iso_now() -> str:
     """UTCのISO8601（Z付き）"""
@@ -30,7 +30,7 @@ def choose_baseline(df_day: pd.DataFrame, basis: str) -> tuple[float | None, str
       - basis == "open": 当日の最初の値（寄り）をまず使う。|open| < EPS なら fallback
       - basis == "stable@10:00": 10:00以降で最初に |val| >= EPS のもの
       - basis == "auto": open を優先し、ダメなら stable@10:00 に倒す
-    どちらで選ばれたかを note（"open" / "stable@10:00" / "first|val|>=EPS" / "no_pct_col"）で返す。
+    最後の最後に「最初の値（条件なし）」で必ず基準を返す（暴発は別関数で抑制）。
     """
     if df_day.empty:
         return None, "no_pct_col"
@@ -49,18 +49,19 @@ def choose_baseline(df_day: pd.DataFrame, basis: str) -> tuple[float | None, str
     if not cand.empty:
         return float(cand.iloc[0]["val"]), "stable@10:00"
 
-    # 3) 最後の fallback: |val| >= EPS の最初の点（時間帯問わず）
+    # 3) |val| >= EPS の最初の点（時間帯問わず）
     cand2 = df_day.loc[df_day["val"].abs() >= EPS]
     if not cand2.empty:
         return float(cand2.iloc[0]["val"]), "first|val|>=EPS"
 
-    return None, "no_pct_col"
+    # 4) 最後の最後の fallback：最初の値（条件なし）
+    return float(df_day.iloc[0]["val"]), "first_any"
 
 def percent_change(first: float, last: float) -> float | None:
     """
-    長期チャートと同じ安全版の%計算:
+    安全版の%計算:
         (last - first) / max(|first|, |last|, EPS) * 100
-    これにより、分母が極小のときに%が異常に発散するのを防ぐ。
+    EPS を 1.0 に引き上げ、小さすぎる分母を強制的に底上げ。
     """
     try:
         if first is None or last is None:
@@ -91,7 +92,6 @@ def main():
         day = df["ts"].dt.floor("D").iloc[-1]
         df_day = df[df["ts"].dt.floor("D") == day]
         if not df_day.empty:
-            # basis 引数のマッピング（"stable10" → "stable@10:00"）
             desired_basis = (
                 "open"
                 if args.basis == "open"
@@ -105,12 +105,9 @@ def main():
 
             last_val = float(df_day.iloc[-1]["val"])
             # “レベル差”は生値で（%ではない）
-            if baseline is not None:
-                delta_level = last_val - baseline
-            else:
-                delta_level = last_val - float(df_day.iloc[0]["val"])
+            delta_level = last_val - float(baseline)
 
-            pct_val = None if baseline is None else percent_change(baseline, last_val)
+            pct_val = percent_change(baseline, last_val)
 
     # --- TXT 出力
     pct_str = "N/A" if pct_val is None else f"{pct_val:+.2f}%"
@@ -121,7 +118,7 @@ def main():
     )
     Path(args.out_text).write_text(text, encoding="utf-8")
 
-    # --- JSON 出力（scale を percent に修正）
+    # --- JSON 出力（scale は percent）
     payload = {
         "index_key": args.index_key,
         "pct_1d": None if pct_val is None else float(pct_val),
