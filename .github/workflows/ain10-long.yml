@@ -1,10 +1,9 @@
-name: AIN-10 • long charts & intraday percent
+name: AIN-10 • long charts & intraday percent (diag)
 
 on:
   workflow_dispatch:
   schedule:
-    # 平日 09:00–17:30 JST の間、10分おき
-    # (= 00:00–08:30 UTC)。必要に応じて調整してください。
+    # 平日 09:00–17:30 JST（= 00:00–08:30 UTC）に10分おき
     - cron: "*/10 0-8 * * 1-5"
 
 permissions:
@@ -21,7 +20,7 @@ env:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 12
 
     steps:
       - name: Checkout
@@ -29,47 +28,72 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Setup Python
+      - name: Show workflow marker & SHA
+        run: |
+          echo "=== MARKER: ain10-long.yml (diag) is loaded ==="
+          echo "GITHUB_SHA=$GITHUB_SHA"
+          echo "BRANCH (ref)=$GITHUB_REF"
+
+      - name: Setup Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
       - name: Install deps
         run: |
+          set -euxo pipefail
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-          # 依存関係確認（デバッグ用）
           python - <<'PY'
           import sys, matplotlib
-          print("Py:", sys.version)
-          print("Matplotlib:", matplotlib.__version__)
+          print("=== DIAG ===")
+          print("Python:", sys.version.split()[0])
+          print("Matplotlib:", getattr(matplotlib, "__version__", "n/a"))
           PY
 
-      # ──────────────────────────────────────────────────────────────
-      # 長期チャートの生成（1d/7d/1m/1y）
-      # ※ scripts/long_charts.py はリポジトリ同梱の前提
-      # ──────────────────────────────────────────────────────────────
+      # ───────── ここから長期チャート ─────────
+      - name: DIAG • Check files before plotting
+        run: |
+          set -euxo pipefail
+          echo "=== ls -la scripts ==="
+          ls -la scripts || true
+          echo "=== ls -la docs/outputs (before) ==="
+          ls -la docs/outputs || true
+          test -f scripts/long_charts.py || (echo "scripts/long_charts.py NOT FOUND" && exit 2)
+          echo "=== MARKER: long_charts step will run ==="
+
       - name: Generate long-term charts
         run: |
           set -euxo pipefail
           python scripts/long_charts.py
+          echo "=== MARKER: long_charts finished ==="
 
-      # ──────────────────────────────────────────────────────────────
-      # 1d 騰落率を算出し、テキスト/JSON を出力
-      #   ・分母は「10:00 以降の最初の非ゼロ」を既定（stable@10:00）
-      #   ・小さすぎる分母は N/A（basis=no_pct_col）
-      # ──────────────────────────────────────────────────────────────
+      - name: DIAG • Check files after plotting
+        run: |
+          set -euxo pipefail
+          echo "=== git status (after plot) ==="
+          git status --porcelain || true
+          echo "=== ls -la docs/outputs (after) ==="
+          ls -la docs/outputs || true
+
+      # ───────── 1d 騰落率（安定基準） ─────────
       - name: Compute 1d percent & write posts
         run: |
           set -euxo pipefail
+          echo "=== MARKER: pct_post step will run ==="
           python scripts/ain10_pct_post.py \
             --index-key "${INDEX_KEY}" \
             --csv "${OUT_DIR}/${INDEX_KEY}_1d.csv" \
             --out-json "${OUT_DIR}/${INDEX_KEY}_stats.json" \
             --out-text "${OUT_DIR}/${INDEX_KEY}_post_intraday.txt" \
             --basis stable@10:00
+          echo "=== MARKER: pct_post finished ==="
+          echo "--- ain10_post_intraday.txt ---"
+          sed -n '1p' "${OUT_DIR}/${INDEX_KEY}_post_intraday.txt" || true
+          echo "--- ain10_stats.json ---"
+          head -c 400 "${OUT_DIR}/${INDEX_KEY}_stats.json" || true
+          echo
 
-      # デバッグ用に生成物をアップロード（任意）
       - name: Upload artifacts (for debug)
         if: always()
         uses: actions/upload-artifact@v4
@@ -81,7 +105,6 @@ jobs:
             docs/outputs/*post*.txt
             docs/outputs/*stats*.json
 
-      # 変更があればコミット
       - name: Commit charts if changed
         run: |
           set -euxo pipefail
