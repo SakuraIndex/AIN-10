@@ -6,7 +6,7 @@ from pathlib import Path
 import pandas as pd
 import matplotlib.pyplot as plt
 from matplotlib.ticker import MaxNLocator
-from matplotlib.dates import AutoDateLocator, AutoDateFormatter  # ← ここが修正点
+from matplotlib.dates import AutoDateLocator, AutoDateFormatter
 
 INDEX_KEY = os.environ.get("INDEX_KEY", "ain10")
 OUT_DIR = Path("docs/outputs")
@@ -50,15 +50,20 @@ def plot_one_span(df: pd.DataFrame, title: str, out_png: Path):
 
     ax.plot(df["ts"].values, df["val"].values, linewidth=2.6, color="#ff615a")
 
-    # 日付ロケータ/フォーマッタ（正しいモジュール：matplotlib.dates）
+    # 日付ロケータ/フォーマッタ（matplotlib.dates）
     major = AutoDateLocator(minticks=5, maxticks=10)
     ax.xaxis.set_major_locator(major)
     ax.xaxis.set_major_formatter(AutoDateFormatter(major))
-    # 軽い目盛り調整（必要に応じて）
-    ax.xaxis.set_minor_locator(MaxNLocator(nbins=50))
+    # マイナー目盛りも日付ロケータで穏やかに
+    minor = AutoDateLocator(minticks=20, maxticks=40)
+    ax.xaxis.set_minor_locator(minor)
+
+    # Yはほどよく間引く
+    ax.yaxis.set_major_locator(MaxNLocator(nbins=6, prune=None))
 
     fig.tight_layout()
-    fig.savefig(out_png, facecolor=fig.get_facecolor())
+    fig.savefig(out_png, facecolor=fig.get_facecolor(), bbox_inches="tight")
+    print(f"[MARKER] saved figure: {out_png}")  # ← 保存ログを明示
     plt.close(fig)
 
 def subset_for_span(df: pd.DataFrame, span: str) -> pd.DataFrame:
@@ -78,16 +83,28 @@ def subset_for_span(df: pd.DataFrame, span: str) -> pd.DataFrame:
         return df
 
 def main():
+    print("[MARKER] long_charts.py started")  # ← 開始ログ
     spans = ["1d", "7d", "1m", "1y"]
     for span in spans:
         csv = OUT_DIR / f"{INDEX_KEY}_{span}.csv"
         if not csv.exists():
+            print(f"[WARN] csv not found: {csv}")
             continue
         df = load_csv(csv)
+        if df.empty:
+            print(f"[WARN] empty df: {csv}")
+            continue
+
         df_span = subset_for_span(df, span)
         if df_span.empty:
+            print(f"[WARN] empty subset for span={span} (csv={csv})")
             continue
+
         out_png = OUT_DIR / f"{INDEX_KEY}_{span}.png"
+        print(
+            f"[MARKER] plotting span={span} rows={len(df_span)} "
+            f"ts_min={df_span['ts'].min()} ts_max={df_span['ts'].max()} -> {out_png}"
+        )
         plot_one_span(df_span, f"{INDEX_KEY.upper()} ({span})", out_png)
 
 if __name__ == "__main__":
