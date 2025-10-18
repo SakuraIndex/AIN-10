@@ -3,13 +3,14 @@
 
 import argparse, json
 from pathlib import Path
+import math
 import pandas as pd
 
-# --- UTC の ISO8601 (Z) を常に安全に返す ---
+EPS = 0.2  # 小さすぎる分母を避けるための閾値（必要に応じて調整）
+
 def iso_now() -> str:
-    # tz_localize / tz_convert を使わず、最初から tz-aware を生成
-    ts = pd.Timestamp.now(tz="UTC")
-    return ts.isoformat().replace("+00:00", "Z")
+    """UTCのISO8601（Z付き）"""
+    return pd.Timestamp.now(tz="UTC").isoformat().replace("+00:00", "Z")
 
 def read_1d(csv_path: Path) -> pd.DataFrame:
     df = pd.read_csv(csv_path)
@@ -21,37 +22,84 @@ def read_1d(csv_path: Path) -> pd.DataFrame:
     df = df.dropna(subset=["ts", "val"]).sort_values("ts").reset_index(drop=True)
     return df
 
+def choose_baseline(df_day: pd.DataFrame, basis: str) -> tuple[float | None, str]:
+    """
+    ベース値を選ぶ:
+      - basis == "open": 当日の最初の値（寄り）をまず使う。|open| < EPS なら fallback
+      - basis == "stable10": 10:00以降で最初に |val| >= EPS のもの
+    どちらで選ばれたかを note（"open" または "stable@10:00"）で返す。
+    見つからない場合 (None, "no_pct_col")
+    """
+    if df_day.empty:
+        return None, "no_pct_col"
+
+    # 1) open を試す
+    if basis in ("open", "auto"):
+        open_val = float(df_day.iloc[0]["val"])
+        if abs(open_val) >= EPS:
+            return open_val, "open"
+
+    # 2) 10:00 以降の安定点
+    mask = (df_day["ts"].dt.hour > 10) | ((df_day["ts"].dt.hour == 10) & (df_day["ts"].dt.minute >= 0))
+    cand = df_day.loc[mask & (df_day["val"].abs() >= EPS)]
+    if not cand.empty:
+        return float(cand.iloc[0]["val"]), "stable@10:00"
+
+    # 3) 最後の fallback: |val| >= EPS の最初の点（時間帯問わず）
+    cand2 = df_day.loc[df_day["val"].abs() >= EPS]
+    if not cand2.empty:
+        return float(cand2.iloc[0]["val"]), "first|val|>=EPS"
+
+    return None, "no_pct_col"
+
+def percent_change(first: float, last: float) -> float | None:
+    """(last - first) / |first| * 100"""
+    try:
+        if first is None or last is None:
+            return None
+        if abs(float(first)) < EPS:
+            return None
+        return (float(last) - float(first)) / abs(float(first)) * 100.0
+    except Exception:
+        return None
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--index-key", required=True)
     ap.add_argument("--csv", required=True, help="docs/outputs/*_1d.csv")
     ap.add_argument("--out-json", required=True)
     ap.add_argument("--out-text", required=True)
-    # basis は自由文字列で受け取る（workflow 側が 'stable@10:00' などを渡してもOK）
-    ap.add_argument("--basis", default="open", help="free-form note (e.g., open / prev_close / stable@10:00)")
+    # open を優先しつつダメなら stable@10:00 に倒す "auto" をデフォルト
+    ap.add_argument("--basis", choices=["open", "stable10", "auto"], default="auto")
     args = ap.parse_args()
 
     df = read_1d(Path(args.csv))
-
     pct_val = None
     delta_level = None
-    basis_note = args.basis   # 表示用だけに使用
+    basis_note = "n/a"
     valid_note = "n/a"
 
     if not df.empty:
-        # 1日の最初(寄り)と最後(終値相当)で計算
-        first_row = df.iloc[0]
-        last_row  = df.iloc[-1]
-        first_val = float(first_row["val"])
-        last_val  = float(last_row["val"])
+        # 当日だけに絞る
+        day = df["ts"].dt.floor("D").iloc[-1]
+        df_day = df[df["ts"].dt.floor("D") == day]
+        if not df_day.empty:
+            baseline, basis_note = choose_baseline(df_day, "open" if args.basis == "open" else ("stable@10:00" if args.basis == "stable10" else "auto"))
+            first_ts = df_day.iloc[0]["ts"]
+            last_ts  = df_day.iloc[-1]["ts"]
+            valid_note = f"{first_ts}->{last_ts}"
 
-        delta_level = last_val - first_val
-        if abs(first_val) >= 1e-9:
-            pct_val = (last_val - first_val) / abs(first_val) * 100.0
-        valid_note = f"{first_row['ts']}->{last_row['ts']}"
+            last_val = float(df_day.iloc[-1]["val"])
+            # “レベル差”は生値で（%ではない）
+            if baseline is not None:
+                delta_level = last_val - baseline
+            else:
+                delta_level = last_val - float(df_day.iloc[0]["val"])
 
-    # --- TXT 出力（X用の短文） ---
-    pct_str   = "N/A" if pct_val is None else f"{pct_val:+.2f}%"
+            pct_val = None if baseline is None else percent_change(baseline, last_val)
+
+    # --- TXT 出力
+    pct_str = "N/A" if pct_val is None else f"{pct_val:+.2f}%"
     delta_str = "N/A" if delta_level is None else f"{delta_level:+.6f}"
     text = (
         f"{args.index_key.upper()} 1d: Δ={delta_str} (level) "
@@ -59,7 +107,7 @@ def main():
     )
     Path(args.out_text).write_text(text, encoding="utf-8")
 
-    # --- JSON 出力（ダッシュボード/他処理向け） ---
+    # --- JSON 出力
     payload = {
         "index_key": args.index_key,
         "pct_1d": None if pct_val is None else float(pct_val),
