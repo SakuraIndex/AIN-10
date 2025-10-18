@@ -12,29 +12,39 @@ INDEX_KEY = os.environ.get("INDEX_KEY", "ain10")
 OUT_DIR = Path("docs/outputs")
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
-# ===== 調整ポイント =====
-EPS = 5.0  # 分母の最小値をさらに上げて極端な騰落率を抑える
-CLAMP_PCT = 100.0  # ±100%を超える場合はクリップ（必要なら調整）
+# 騰落率の安定化パラメータ
+EPS = 5.0            # 分母の下限（小さすぎる値で暴発しないよう底上げ）
+CLAMP_PCT = 100.0    # 最終クリップ（±100%を上限に）
 
-# ---- ダークテーマ + 軸文字白統一 ----
+# ---- ダークテーマ + 軸文字「完全白」統一 ----
 def apply_dark_theme(fig, ax):
     fig.patch.set_facecolor("#111317")
     ax.set_facecolor("#111317")
 
+    # 枠線消し
     for spine in ax.spines.values():
         spine.set_visible(False)
 
-    # 軸・タイトル・ラベル全て白に統一
-    ax.tick_params(colors="#ffffff", labelsize=10)
+    # まず一括で白
+    ax.tick_params(axis="both", colors="#ffffff", labelsize=10)
     ax.yaxis.label.set_color("#ffffff")
     ax.xaxis.label.set_color("#ffffff")
     ax.title.set_color("#ffffff")
 
+    # グリッドは白系
     ax.grid(True, which="major", linestyle="-", linewidth=0.6, alpha=0.18, color="#ffffff")
     ax.grid(True, which="minor", linestyle="-", linewidth=0.4, alpha=0.10, color="#ffffff")
 
+def force_all_white(ax):
+    """他の設定に上書きされても最終的に文字が白になるよう強制"""
+    ax.tick_params(axis="both", colors="#ffffff")
+    for tick in ax.get_xticklabels() + ax.get_yticklabels():
+        tick.set_color("#ffffff")
+    ax.xaxis.label.set_color("#ffffff")
+    ax.yaxis.label.set_color("#ffffff")
+    ax.title.set_color("#ffffff")
 
-# ---- CSV読込 ----
+# ---- CSV 読み込み ----
 def load_csv(csv_path: Path) -> pd.DataFrame:
     df = pd.read_csv(csv_path)
     if df.shape[1] < 2:
@@ -45,8 +55,7 @@ def load_csv(csv_path: Path) -> pd.DataFrame:
     df = df.dropna(subset=["ts", "val"]).sort_values("ts").reset_index(drop=True)
     return df
 
-
-# ---- 基準点 ----
+# ---- 基準点選択 ----
 def stable_baseline(df_day: pd.DataFrame) -> float | None:
     if df_day.empty:
         return None
@@ -57,22 +66,22 @@ def stable_baseline(df_day: pd.DataFrame) -> float | None:
     cand2 = df_day.loc[df_day["val"].abs() >= EPS]
     if not cand2.empty:
         return float(cand2.iloc[0]["val"])
-    return float(df_day.iloc[0]["val"])
-
+    return float(df_day.iloc[0]["val"])  # 最終フォールバック
 
 # ---- 騰落率計算 ----
 def calc_sane_pct(base: float, close: float) -> float:
     try:
         denom = max(abs(base), abs(close), EPS)
         pct = (close - base) / denom * 100.0
-        # 極端値を制限
-        pct = max(min(pct, CLAMP_PCT), -CLAMP_PCT)
+        if pct > CLAMP_PCT:
+            pct = CLAMP_PCT
+        elif pct < -CLAMP_PCT:
+            pct = -CLAMP_PCT
         return pct
     except Exception:
         return 0.0
 
-
-# ---- 時系列変換 ----
+# ---- パーセント系列化 ----
 def make_pct_series(df: pd.DataFrame, span: str) -> pd.DataFrame:
     if df.empty:
         return df
@@ -83,9 +92,10 @@ def make_pct_series(df: pd.DataFrame, span: str) -> pd.DataFrame:
         if df_day.empty:
             return df_day
         base = stable_baseline(df_day)
+        if base is None:
+            return pd.DataFrame()
         df_day["pct"] = df_day["val"].apply(lambda x: calc_sane_pct(base, x))
         return df_day
-
     else:
         last = df["ts"].max()
         days = {"7d": 7, "1m": 30, "1y": 365}.get(span, 7)
@@ -95,7 +105,6 @@ def make_pct_series(df: pd.DataFrame, span: str) -> pd.DataFrame:
         base = float(df_span.iloc[0]["val"])
         df_span["pct"] = df_span["val"].apply(lambda x: calc_sane_pct(base, x))
         return df_span
-
 
 # ---- 描画 ----
 def plot_one_span(df_pct: pd.DataFrame, title: str, out_png: Path):
@@ -114,10 +123,12 @@ def plot_one_span(df_pct: pd.DataFrame, title: str, out_png: Path):
     ax.yaxis.set_minor_locator(MaxNLocator(nbins=50))
     ax.yaxis.set_major_locator(MaxNLocator(nbins=7))
 
+    # 最後に白を念押し
+    force_all_white(ax)
+
     fig.tight_layout()
     fig.savefig(out_png, facecolor=fig.get_facecolor())
     plt.close(fig)
-
 
 # ---- メイン ----
 def main():
@@ -133,7 +144,6 @@ def main():
         out_png = OUT_DIR / f"{INDEX_KEY}_{span}.png"
         title = f"{INDEX_KEY.upper()} ({span})"
         plot_one_span(df_pct, title, out_png)
-
 
 if __name__ == "__main__":
     main()
