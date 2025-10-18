@@ -1,18 +1,20 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import argparse, json
+import argparse
+import json
 from pathlib import Path
-import math
 import pandas as pd
 
-EPS = 0.2  # 小さすぎる分母を避けるための閾値（必要に応じて調整）
+# 小さすぎる分母を避ける閾値（long_charts.py と揃える）
+EPS = 0.2
 
 def iso_now() -> str:
     """UTCのISO8601（Z付き）"""
     return pd.Timestamp.now(tz="UTC").isoformat().replace("+00:00", "Z")
 
 def read_1d(csv_path: Path) -> pd.DataFrame:
+    """docs/outputs/*_1d.csv を読み、[ts,val] に正規化して昇順整列"""
     df = pd.read_csv(csv_path)
     if df.shape[1] < 2:
         raise ValueError(f"CSV must have >= 2 columns: {csv_path}")
@@ -26,21 +28,23 @@ def choose_baseline(df_day: pd.DataFrame, basis: str) -> tuple[float | None, str
     """
     ベース値を選ぶ:
       - basis == "open": 当日の最初の値（寄り）をまず使う。|open| < EPS なら fallback
-      - basis == "stable10": 10:00以降で最初に |val| >= EPS のもの
-    どちらで選ばれたかを note（"open" または "stable@10:00"）で返す。
-    見つからない場合 (None, "no_pct_col")
+      - basis == "stable@10:00": 10:00以降で最初に |val| >= EPS のもの
+      - basis == "auto": open を優先し、ダメなら stable@10:00 に倒す
+    どちらで選ばれたかを note（"open" / "stable@10:00" / "first|val|>=EPS" / "no_pct_col"）で返す。
     """
     if df_day.empty:
         return None, "no_pct_col"
 
-    # 1) open を試す
+    # 1) open を試す（auto と open のとき）
     if basis in ("open", "auto"):
         open_val = float(df_day.iloc[0]["val"])
         if abs(open_val) >= EPS:
             return open_val, "open"
 
     # 2) 10:00 以降の安定点
-    mask = (df_day["ts"].dt.hour > 10) | ((df_day["ts"].dt.hour == 10) & (df_day["ts"].dt.minute >= 0))
+    mask = (df_day["ts"].dt.hour > 10) | (
+        (df_day["ts"].dt.hour == 10) & (df_day["ts"].dt.minute >= 0)
+    )
     cand = df_day.loc[mask & (df_day["val"].abs() >= EPS)]
     if not cand.empty:
         return float(cand.iloc[0]["val"]), "stable@10:00"
@@ -53,13 +57,16 @@ def choose_baseline(df_day: pd.DataFrame, basis: str) -> tuple[float | None, str
     return None, "no_pct_col"
 
 def percent_change(first: float, last: float) -> float | None:
-    """(last - first) / |first| * 100"""
+    """
+    長期チャートと同じ安全版の%計算:
+        (last - first) / max(|first|, |last|, EPS) * 100
+    これにより、分母が極小のときに%が異常に発散するのを防ぐ。
+    """
     try:
         if first is None or last is None:
             return None
-        if abs(float(first)) < EPS:
-            return None
-        return (float(last) - float(first)) / abs(float(first)) * 100.0
+        denom = max(abs(float(first)), abs(float(last)), EPS)
+        return (float(last) - float(first)) / denom * 100.0
     except Exception:
         return None
 
@@ -74,8 +81,8 @@ def main():
     args = ap.parse_args()
 
     df = read_1d(Path(args.csv))
-    pct_val = None
-    delta_level = None
+    pct_val: float | None = None
+    delta_level: float | None = None
     basis_note = "n/a"
     valid_note = "n/a"
 
@@ -84,9 +91,16 @@ def main():
         day = df["ts"].dt.floor("D").iloc[-1]
         df_day = df[df["ts"].dt.floor("D") == day]
         if not df_day.empty:
-            baseline, basis_note = choose_baseline(df_day, "open" if args.basis == "open" else ("stable@10:00" if args.basis == "stable10" else "auto"))
+            # basis 引数のマッピング（"stable10" → "stable@10:00"）
+            desired_basis = (
+                "open"
+                if args.basis == "open"
+                else ("stable@10:00" if args.basis == "stable10" else "auto")
+            )
+            baseline, basis_note = choose_baseline(df_day, desired_basis)
+
             first_ts = df_day.iloc[0]["ts"]
-            last_ts  = df_day.iloc[-1]["ts"]
+            last_ts = df_day.iloc[-1]["ts"]
             valid_note = f"{first_ts}->{last_ts}"
 
             last_val = float(df_day.iloc[-1]["val"])
@@ -107,16 +121,18 @@ def main():
     )
     Path(args.out_text).write_text(text, encoding="utf-8")
 
-    # --- JSON 出力
+    # --- JSON 出力（scale を percent に修正）
     payload = {
         "index_key": args.index_key,
         "pct_1d": None if pct_val is None else float(pct_val),
         "delta_level": None if delta_level is None else float(delta_level),
-        "scale": "level",
+        "scale": "percent",
         "basis": basis_note,
         "updated_at": iso_now(),
     }
-    Path(args.out_json).write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    Path(args.out_json).write_text(
+        json.dumps(payload, ensure_ascii=False), encoding="utf-8"
+    )
 
 if __name__ == "__main__":
     main()
