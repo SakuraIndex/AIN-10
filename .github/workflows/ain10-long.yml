@@ -76,7 +76,7 @@ jobs:
           echo "=== ls -la docs/outputs (after) ==="
           ls -la docs/outputs || true
 
-      # ───────── 1d 騰落率（より堅め: open を基準） ─────────
+      # ───────── 1d 騰落率（確定系。先に書く） ─────────
       - name: Compute 1d percent & write posts (from 1d.csv)
         run: |
           set -euxo pipefail
@@ -90,22 +90,24 @@ jobs:
           echo "=== MARKER: pct_post finished ==="
           echo "--- ${INDEX_KEY}_post_intraday.txt (from 1d.csv) ---"
           sed -n '1p' "${OUT_DIR}/${INDEX_KEY}_post_intraday.txt" || true
-          echo "--- ${INDEX_KEY}_stats.json ---"
+          echo "--- ${INDEX_KEY}_stats.json (1d-based) ---"
           head -c 400 "${OUT_DIR}/${INDEX_KEY}_stats.json" || true
           echo
 
-      # ───────── intraday テキスト（intraday.csv をソースに上書き生成） ─────────
+      # ───────── intraday（速報系）。サイト用 stats.json を intraday で上書き ─────────
       - name: Make intraday post (from intraday.csv)
         run: |
           set -euxo pipefail
-          test -f scripts/make_intraday_post.py || (echo "scripts/make_intraday_post.py NOT FOUND" && exit 3)
           if [ -f "${OUT_DIR}/${INDEX_KEY}_intraday.csv" ]; then
             python scripts/make_intraday_post.py \
               --index-key "${INDEX_KEY}" \
               --csv "${OUT_DIR}/${INDEX_KEY}_intraday.csv" \
-              --out-text "${OUT_DIR}/${INDEX_KEY}_post_intraday.txt"
+              --out-text "${OUT_DIR}/${INDEX_KEY}_post_intraday.txt" \
+              --out-json "${OUT_DIR}/${INDEX_KEY}_stats.json"
             echo "--- ${INDEX_KEY}_post_intraday.txt (from intraday.csv) ---"
             sed -n '1p' "${OUT_DIR}/${INDEX_KEY}_post_intraday.txt" || true
+            echo "--- ${INDEX_KEY}_stats.json (intraday-based override) ---"
+            head -c 400 "${OUT_DIR}/${INDEX_KEY}_stats.json" || true
           else
             echo "WARN: ${OUT_DIR}/${INDEX_KEY}_intraday.csv not found, skipped intraday post."
           fi
