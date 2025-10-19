@@ -2,12 +2,14 @@
 # -*- coding: utf-8 -*-
 
 import argparse
+import json
 from pathlib import Path
 import pandas as pd
 
 INDEX_KEY_DEFAULT = "ain10"
 OUT_DIR = Path("docs/outputs")
 
+# 騰落率ロジック（long_charts / ain10_pct_post と整合）
 EPS = 5.0
 CLAMP_PCT = 30.0
 
@@ -22,6 +24,7 @@ def read_intraday(csv_path: Path) -> pd.DataFrame:
     return df
 
 def choose_baseline(df_day: pd.DataFrame) -> tuple[float | None, str]:
+    """open→10:00以降安定→|val|>=EPS→最初の値 の順で基準を決める"""
     if df_day.empty:
         return None, "no_pct_col"
     open_val = float(df_day.iloc[0]["val"])
@@ -48,22 +51,48 @@ def percent_change(first: float, last: float) -> float | None:
     except Exception:
         return None
 
+def iso_now() -> str:
+    return pd.Timestamp.now(tz="UTC").isoformat().replace("+00:00", "Z")
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--index-key", default=INDEX_KEY_DEFAULT)
     ap.add_argument("--csv", default=str(OUT_DIR / f"{INDEX_KEY_DEFAULT}_intraday.csv"))
     ap.add_argument("--out-text", default=str(OUT_DIR / f"{INDEX_KEY_DEFAULT}_post_intraday.txt"))
+    # 追加：サイトに出す stats.json も intraday ベースで上書き
+    ap.add_argument("--out-json", default=None)
     args = ap.parse_args()
 
     df = read_intraday(Path(args.csv))
     if df.empty:
         Path(args.out_text).write_text(f"{args.index_key.upper()} intraday: (no data)\n", encoding="utf-8")
+        if args.out_json:
+            payload = {
+                "index_key": args.index_key,
+                "pct_1d": None,
+                "delta_level": None,
+                "scale": "percent",
+                "basis": "no_data",
+                "updated_at": iso_now(),
+            }
+            Path(args.out_json).write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
         return
 
+    # 当日データ
     day = df["ts"].dt.floor("D").iloc[-1]
     df_day = df[df["ts"].dt.floor("D") == day]
     if df_day.empty:
         Path(args.out_text).write_text(f"{args.index_key.upper()} intraday: (no data)\n", encoding="utf-8")
+        if args.out_json:
+            payload = {
+                "index_key": args.index_key,
+                "pct_1d": None,
+                "delta_level": None,
+                "scale": "percent",
+                "basis": "no_pct_col",
+                "updated_at": iso_now(),
+            }
+            Path(args.out_json).write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
         return
 
     base, basis_note = choose_baseline(df_day)
@@ -74,10 +103,26 @@ def main():
     delta_level = last_val - float(base)
     pct_val = percent_change(base, last_val)
 
+    # --- TXT 出力（従来どおり）
     pct_str = "N/A" if pct_val is None else f"{pct_val:+.2f}%"
     delta_str = f"{delta_level:+.6f}"
-    text = f"{args.index_key.upper()} 1d: Δ={delta_str} (level) A%={pct_str} (basis={basis_note} valid={first_ts}->{last_ts})\n"
+    text = (
+        f"{args.index_key.upper()} 1d: Δ={delta_str} (level) "
+        f"A%={pct_str} (basis={basis_note} valid={first_ts}->{last_ts})\n"
+    )
     Path(args.out_text).write_text(text, encoding="utf-8")
+
+    # --- JSON 出力（サイト表示用：stats.json を intraday ベースで上書き）
+    if args.out_json:
+        payload = {
+            "index_key": args.index_key,
+            "pct_1d": None if pct_val is None else float(pct_val),
+            "delta_level": float(delta_level),
+            "scale": "percent",
+            "basis": basis_note,
+            "updated_at": iso_now(),
+        }
+        Path(args.out_json).write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
 
 if __name__ == "__main__":
     main()
