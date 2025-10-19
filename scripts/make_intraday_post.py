@@ -54,18 +54,30 @@ def percent_change(first: float, last: float) -> float | None:
 def iso_now() -> str:
     return pd.Timestamp.now(tz="UTC").isoformat().replace("+00:00", "Z")
 
+def write_both_texts(index_key: str, text: str, main_txt: Path):
+    """
+    互換のため TXT を2つの名前に出力：
+    - ain10_post_intraday.txt （現行）
+    - ain_10_post_intraday.txt（レガシー対策）
+    """
+    main_txt.write_text(text, encoding="utf-8")
+    # レガシー名（アンダースコア入り）にも複製
+    legacy = main_txt.parent / main_txt.name.replace("ain10_", "ain_10_")
+    if "ain10_" in main_txt.name and legacy.name != main_txt.name:
+        legacy.write_text(text, encoding="utf-8")
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--index-key", default=INDEX_KEY_DEFAULT)
     ap.add_argument("--csv", default=str(OUT_DIR / f"{INDEX_KEY_DEFAULT}_intraday.csv"))
     ap.add_argument("--out-text", default=str(OUT_DIR / f"{INDEX_KEY_DEFAULT}_post_intraday.txt"))
-    # 追加：サイトに出す stats.json も intraday ベースで上書き
-    ap.add_argument("--out-json", default=None)
+    ap.add_argument("--out-json", default=None)  # サイト表示用（stats.jsonをintradayで上書き）
     args = ap.parse_args()
 
     df = read_intraday(Path(args.csv))
     if df.empty:
-        Path(args.out_text).write_text(f"{args.index_key.upper()} intraday: (no data)\n", encoding="utf-8")
+        text = f"{args.index_key.upper()} intraday: (no data)\n"
+        write_both_texts(args.index_key, text, Path(args.out_text))
         if args.out_json:
             payload = {
                 "index_key": args.index_key,
@@ -82,7 +94,8 @@ def main():
     day = df["ts"].dt.floor("D").iloc[-1]
     df_day = df[df["ts"].dt.floor("D") == day]
     if df_day.empty:
-        Path(args.out_text).write_text(f"{args.index_key.upper()} intraday: (no data)\n", encoding="utf-8")
+        text = f"{args.index_key.upper()} intraday: (no data)\n"
+        write_both_texts(args.index_key, text, Path(args.out_text))
         if args.out_json:
             payload = {
                 "index_key": args.index_key,
@@ -103,16 +116,17 @@ def main():
     delta_level = last_val - float(base)
     pct_val = percent_change(base, last_val)
 
-    # --- TXT 出力（従来どおり）
     pct_str = "N/A" if pct_val is None else f"{pct_val:+.2f}%"
     delta_str = f"{delta_level:+.6f}"
     text = (
         f"{args.index_key.upper()} 1d: Δ={delta_str} (level) "
         f"A%={pct_str} (basis={basis_note} valid={first_ts}->{last_ts})\n"
     )
-    Path(args.out_text).write_text(text, encoding="utf-8")
 
-    # --- JSON 出力（サイト表示用：stats.json を intraday ベースで上書き）
+    # TXT を現行名＋レガシー名の両方に出力
+    write_both_texts(args.index_key, text, Path(args.out_text))
+
+    # JSON（サイト表示用）を intraday で上書き
     if args.out_json:
         payload = {
             "index_key": args.index_key,
