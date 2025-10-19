@@ -1,5 +1,3 @@
-# 省略せずにこのまま置き換え
-
 name: AIN-10 • long charts & intraday percent (diag)
 
 on:
@@ -87,8 +85,6 @@ jobs:
             --out-json "${OUT_DIR}/${INDEX_KEY}_stats.json" \
             --out-text "${OUT_DIR}/${INDEX_KEY}_post_intraday.txt" \
             --basis open
-          echo "--- ${INDEX_KEY}_post_intraday.txt (from 1d.csv) ---"
-          sed -n '1p' "${OUT_DIR}/${INDEX_KEY}_post_intraday.txt" || true
           echo "--- ${INDEX_KEY}_stats.json (1d-based) ---"
           head -c 400 "${OUT_DIR}/${INDEX_KEY}_stats.json" || true
           echo
@@ -103,13 +99,14 @@ jobs:
               --csv "${OUT_DIR}/${INDEX_KEY}_intraday.csv" \
               --out-text "${OUT_DIR}/${INDEX_KEY}_post_intraday.txt" \
               --out-json "${OUT_DIR}/${INDEX_KEY}_stats.json"
-            echo "--- ${INDEX_KEY}_post_intraday.txt (from intraday.csv) ---"
-            sed -n '1p' "${OUT_DIR}/${INDEX_KEY}_post_intraday.txt" || true
-            # レガシー名も出力されているか確認
-            if [ -f "${OUT_DIR}/ain_10_post_intraday.txt" ]; then
-              echo "--- ain_10_post_intraday.txt (legacy alias) ---"
-              sed -n '1p' "${OUT_DIR}/ain_10_post_intraday.txt" || true
-            fi
+            echo "--- TXT variants (intraday) ---"
+            for f in \
+              "${OUT_DIR}/${INDEX_KEY}_post_intraday.txt" \
+              "${OUT_DIR}/ain_10_post_intraday.txt" \
+              "${OUT_DIR}/${INDEX_KEY}_intraday_post.txt" \
+              "${OUT_DIR}/ain_10_intraday_post.txt"; do
+              if [ -f "$f" ]; then echo "$f"; sed -n '1p' "$f" || true; fi
+            done
             echo "--- ${INDEX_KEY}_stats.json (intraday-based override) ---"
             head -c 400 "${OUT_DIR}/${INDEX_KEY}_stats.json" || true
           else
