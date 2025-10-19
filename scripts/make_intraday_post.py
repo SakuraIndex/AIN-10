@@ -54,17 +54,22 @@ def percent_change(first: float, last: float) -> float | None:
 def iso_now() -> str:
     return pd.Timestamp.now(tz="UTC").isoformat().replace("+00:00", "Z")
 
-def write_both_texts(index_key: str, text: str, main_txt: Path):
+def write_all_text_variants(text: str, primary: Path):
     """
-    互換のため TXT を2つの名前に出力：
-    - ain10_post_intraday.txt （現行）
-    - ain_10_post_intraday.txt（レガシー対策）
+    互換のため TXT を4つの名前に出力：
+      1) ain10_post_intraday.txt        （現行）
+      2) ain_10_post_intraday.txt       （アンダースコア互換）
+      3) ain10_intraday_post.txt        （語順互換）
+      4) ain_10_intraday_post.txt       （語順＋アンダースコア互換）
     """
-    main_txt.write_text(text, encoding="utf-8")
-    # レガシー名（アンダースコア入り）にも複製
-    legacy = main_txt.parent / main_txt.name.replace("ain10_", "ain_10_")
-    if "ain10_" in main_txt.name and legacy.name != main_txt.name:
-        legacy.write_text(text, encoding="utf-8")
+    variants = {
+        primary.name,  # ain10_post_intraday.txt
+        primary.name.replace("ain10_", "ain_10_"),
+        primary.name.replace("post_intraday", "intraday_post"),
+        primary.name.replace("ain10_", "ain_10_").replace("post_intraday", "intraday_post"),
+    }
+    for name in variants:
+        (primary.parent / name).write_text(text, encoding="utf-8")
 
 def main():
     ap = argparse.ArgumentParser()
@@ -77,7 +82,7 @@ def main():
     df = read_intraday(Path(args.csv))
     if df.empty:
         text = f"{args.index_key.upper()} intraday: (no data)\n"
-        write_both_texts(args.index_key, text, Path(args.out_text))
+        write_all_text_variants(text, Path(args.out_text))
         if args.out_json:
             payload = {
                 "index_key": args.index_key,
@@ -95,7 +100,7 @@ def main():
     df_day = df[df["ts"].dt.floor("D") == day]
     if df_day.empty:
         text = f"{args.index_key.upper()} intraday: (no data)\n"
-        write_both_texts(args.index_key, text, Path(args.out_text))
+        write_all_text_variants(text, Path(args.out_text))
         if args.out_json:
             payload = {
                 "index_key": args.index_key,
@@ -123,8 +128,8 @@ def main():
         f"A%={pct_str} (basis={basis_note} valid={first_ts}->{last_ts})\n"
     )
 
-    # TXT を現行名＋レガシー名の両方に出力
-    write_both_texts(args.index_key, text, Path(args.out_text))
+    # TXT（4バリアント）出力
+    write_all_text_variants(text, Path(args.out_text))
 
     # JSON（サイト表示用）を intraday で上書き
     if args.out_json:
