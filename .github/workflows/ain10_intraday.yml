@@ -16,11 +16,11 @@ on:
         required: true
         default: "09:00"
       basis:
-        description: "Return basis label"
+        description: "Return basis label (unused by legacy CLI)"
         required: true
         default: "prev_close"
       value_type:
-        description: "ratio | percent (空なら既定を使用)"
+        description: "ratio | percent (unused by legacy CLI)"
         required: false
         default: ""
 
@@ -35,7 +35,6 @@ env:
   SITE_REPO: SakuraIndex/Sakura-Index-Site
   SITE_BRANCH: main
   PUBLISH_DIR: charts/AIN-10
-  VALUE_TYPE_DEFAULT: percent
 
 concurrency:
   group: intraday-${{ github.ref }}--AIN10
@@ -45,6 +44,7 @@ jobs:
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 12
+
     steps:
       - name: Checkout (this repo)
         uses: actions/checkout@v4
@@ -62,7 +62,10 @@ jobs:
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
           # フォールバック描画用の最低限
-          python -c "import sys, subprocess; subprocess.check_call([sys.executable,'-m','pip','install','pandas','matplotlib'])"
+          python - <<'PY'
+          import sys, subprocess
+          subprocess.check_call([sys.executable, "-m", "pip", "install", "pandas", "matplotlib"])
+          PY
 
       - name: Verify inputs & files
         run: |
@@ -82,12 +85,6 @@ jobs:
           fi
 
       - name: Generate intraday snapshot and post (with fallback)
-        env:
-          SESSION_START: ${{ inputs.session_start }}
-          SESSION_END:   ${{ inputs.session_end }}
-          DAY_ANCHOR:    ${{ inputs.day_anchor }}
-          BASIS:         ${{ inputs.basis }}
-          VALUE_TYPE_IN: ${{ inputs.value_type }}
         run: |
           set -euo pipefail
 
@@ -96,26 +93,15 @@ jobs:
           SNAPSHOT_PNG="docs/outputs/ain10_intraday.png"
           mkdir -p docs/outputs
 
-          VALUE_TYPE="${VALUE_TYPE_IN}"
-          if [ -z "${VALUE_TYPE}" ]; then VALUE_TYPE="${VALUE_TYPE_DEFAULT}"; fi
-
           echo "=== Generate ${LABEL} intraday snapshot ==="
-          echo "VALUE_TYPE=${VALUE_TYPE} (default=${VALUE_TYPE_DEFAULT})"
-
+          # ※ AIN-10 の make_intraday_post.py は legacy CLI のため最小セットのみ渡す
           python scripts/make_intraday_post.py \
             --index-key "${INDEX_KEY}" \
             --csv "${CSV}" \
             --out-json "${OUT_JSON}" \
-            --out-text "${OUT_TEXT}" \
-            --session-start "${SESSION_START}" \
-            --session-end   "${SESSION_END}" \
-            --day-anchor    "${DAY_ANCHOR}" \
-            --basis         "${BASIS}" \
-            --label         "${LABEL}" \
-            --dt-col        "${DT_COL}" \
-            --value-type    "${VALUE_TYPE}"
+            --out-text "${OUT_TEXT}"
 
-          # PNG が無い場合のフォールバックは外部スクリプトで生成
+          # PNG がない場合はフォールバックで作成
           if [ ! -f "${SNAPSHOT_PNG}" ]; then
             echo "[fallback] ${SNAPSHOT_PNG} を生成します"
             python scripts/plot_fallback.py \
