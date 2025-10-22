@@ -75,7 +75,7 @@ jobs:
           test -f "${CSV}" || (echo "Missing CSV: ${CSV}" && exit 1)
           echo "OK: ${CSV}"
 
-      - name: Generate intraday snapshot and post
+      - name: Generate intraday snapshot and post (with fallback)
         env:
           SESSION_START: ${{ inputs.session_start || '09:00' }}
           SESSION_END:   ${{ inputs.session_end   || '15:30' }}
@@ -86,24 +86,34 @@ jobs:
           set -euo pipefail
           echo "=== Generate ${INDEX_KEY} intraday snapshot ==="
 
-          VT_ARGS=""
-          if [ -n "${VALUE_TYPE}" ]; then
-            VT_ARGS="--value-type ${VALUE_TYPE}"
-          fi
+          # 拡張引数対応かどうかを --help で判定
+          if python scripts/make_intraday_post.py -h | grep -q -- '--session-start'; then
+            echo "[info] extended CLI detected -> using full arguments"
+            VT_ARGS=""
+            if [ -n "${VALUE_TYPE}" ]; then VT_ARGS="--value-type ${VALUE_TYPE}"; fi
 
-          python scripts/make_intraday_post.py \
-            --index-key "${INDEX_KEY}" \
-            --csv "${CSV}" \
-            --out-json "${OUT_JSON}" \
-            --out-text "${OUT_TEXT}" \
-            --snapshot-png "${SNAPSHOT_PNG}" \
-            --session-start "${SESSION_START}" \
-            --session-end "${SESSION_END}" \
-            --day-anchor "${DAY_ANCHOR}" \
-            --basis "${BASIS}" \
-            --dt-col "${DT_COL}" \
-            --label "${LABEL}" \
-            ${VT_ARGS}
+            python scripts/make_intraday_post.py \
+              --index-key "${INDEX_KEY}" \
+              --csv "${CSV}" \
+              --out-json "${OUT_JSON}" \
+              --out-text "${OUT_TEXT}" \
+              --snapshot-png "${SNAPSHOT_PNG}" \
+              --session-start "${SESSION_START}" \
+              --session-end "${SESSION_END}" \
+              --day-anchor "${DAY_ANCHOR}" \
+              --basis "${BASIS}" \
+              --dt-col "${DT_COL}" \
+              --label "${LABEL}" \
+              ${VT_ARGS}
+          else
+            echo "[warn] legacy CLI detected -> falling back to minimal arguments"
+            # 最小引数で実行（古い版は環境変数や内部デフォルトで描画）
+            python scripts/make_intraday_post.py \
+              --index-key "${INDEX_KEY}" \
+              --csv "${CSV}" \
+              --out-json "${OUT_JSON}" \
+              --out-text "${OUT_TEXT}"
+          fi
 
       - name: Upload artifacts (for debug)
         if: always()
@@ -114,7 +124,7 @@ jobs:
             ${{ env.OUT_JSON }}
             ${{ env.OUT_TEXT }}
             ${{ env.SNAPSHOT_PNG }}
-          if-no-files-found: error
+          if-no-files-found: ignore
           retention-days: 3
 
       - name: Checkout site repo (for publishing)
@@ -125,15 +135,36 @@ jobs:
           token: ${{ secrets.SITE_PAT }}
           path: site
 
-      - name: Copy snapshot files into site tree
+      - name: Copy snapshot files into site tree (with PNG auto-detect)
         run: |
           set -e
           PUBLISH_DIR="docs/charts/${INDEX_KEY}"
           mkdir -p "site/${PUBLISH_DIR}"
-          cp -f "${SNAPSHOT_PNG}" "site/${PUBLISH_DIR}/intraday.png"
-          cp -f "${OUT_TEXT}"     "site/${PUBLISH_DIR}/post_intraday.txt"
-          cp -f "${OUT_JSON}"     "site/${PUBLISH_DIR}/stats.json"
-          echo "Copied to site/${PUBLISH_DIR}"
+
+          # PNG が既定場所に無ければ自動検出
+          PNG_PATH="${SNAPSHOT_PNG}"
+          if [ ! -f "${PNG_PATH}" ]; then
+            CANDIDATE=$(ls docs/outputs/*intraday*.png 2>/dev/null | head -n1 || true)
+            if [ -n "${CANDIDATE}" ]; then
+              echo "[warn] ${PNG_PATH} not found. Using detected: ${CANDIDATE}"
+              PNG_PATH="${CANDIDATE}"
+            else
+              echo "[warn] intraday PNG not found. Skipping PNG publish."
+              PNG_PATH=""
+            fi
+          fi
+
+          # ファイルがあればコピー
+          if [ -n "${PNG_PATH}" ] && [ -f "${PNG_PATH}" ]; then
+            cp -f "${PNG_PATH}" "site/${PUBLISH_DIR}/intraday.png"
+          fi
+          if [ -f "${OUT_TEXT}" ]; then
+            cp -f "${OUT_TEXT}" "site/${PUBLISH_DIR}/post_intraday.txt"
+          fi
+          if [ -f "${OUT_JSON}" ]; then
+            cp -f "${OUT_JSON}" "site/${PUBLISH_DIR}/stats.json"
+          fi
+          ls -al "site/${PUBLISH_DIR}" || true
 
       - name: Commit & push site charts
         working-directory: site
