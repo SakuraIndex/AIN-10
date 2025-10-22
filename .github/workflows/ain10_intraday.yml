@@ -45,7 +45,6 @@ jobs:
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 12
-
     steps:
       - name: Checkout (this repo)
         uses: actions/checkout@v4
@@ -62,7 +61,7 @@ jobs:
           set -e
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-          # フォールバック描画用に最低限を追加（heredocは使わない）
+          # フォールバック描画用の最低限
           python -c "import sys, subprocess; subprocess.check_call([sys.executable,'-m','pip','install','pandas','matplotlib'])"
 
       - name: Verify inputs & files
@@ -103,7 +102,6 @@ jobs:
           echo "=== Generate ${LABEL} intraday snapshot ==="
           echo "VALUE_TYPE=${VALUE_TYPE} (default=${VALUE_TYPE_DEFAULT})"
 
-          # 生成（--snapshot-png は未サポートの実装があるため付けない）
           python scripts/make_intraday_post.py \
             --index-key "${INDEX_KEY}" \
             --csv "${CSV}" \
@@ -117,43 +115,20 @@ jobs:
             --dt-col        "${DT_COL}" \
             --value-type    "${VALUE_TYPE}"
 
-          # PNG が無い場合のフォールバック（簡易プロット）
+          # PNG が無い場合のフォールバックは外部スクリプトで生成
           if [ ! -f "${SNAPSHOT_PNG}" ]; then
             echo "[fallback] ${SNAPSHOT_PNG} を生成します"
-            python - <<'PY'
-import pandas as pd
-import matplotlib.pyplot as plt
-import pathlib
-
-csv_path = pathlib.Path("docs/outputs/ain10_intraday.csv")
-png_path = pathlib.Path("docs/outputs/ain10_intraday.png")
-
-df = pd.read_csv(csv_path)
-num_cols = [c for c in df.columns if c != "Datetime"]
-num_cols = [c for c in num_cols if pd.api.types.is_numeric_dtype(df[c])]
-if not num_cols:
-    y = [0]
-    x = [0]
-else:
-    y = df[num_cols].mean(axis=1).tolist()
-    x = range(len(y))
-
-plt.figure(figsize=(8, 3), dpi=160)
-plt.plot(list(x), list(y))
-plt.title("AIN-10 Intraday (fallback)")
-plt.xlabel("Time")
-plt.ylabel("Index (level)")
-plt.tight_layout()
-png_path.parent.mkdir(parents=True, exist_ok=True)
-plt.savefig(png_path, bbox_inches="tight")
-plt.close()
-PY
+            python scripts/plot_fallback.py \
+              --csv "${CSV}" \
+              --out "${SNAPSHOT_PNG}" \
+              --title "${LABEL} Intraday (fallback)" \
+              --dt-col "${DT_COL}"
           fi
 
           ls -l "${OUT_JSON}" "${OUT_TEXT}" || true
           ls -l "${SNAPSHOT_PNG}"
 
-      # デバッグ用 artifact は無効化（Warning 抑止）
+      # デバッグ artifact は出さない（Warning 抑止）
       - name: Upload artifacts (for debug)
         if: false
         uses: actions/upload-artifact@v4
