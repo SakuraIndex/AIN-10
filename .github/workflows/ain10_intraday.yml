@@ -62,11 +62,8 @@ jobs:
           set -e
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-          # フォールバック描画用
-          python - <<'PY'
-import sys, subprocess
-subprocess.check_call([sys.executable, "-m", "pip", "install", "pandas", "matplotlib"])
-PY
+          # フォールバック描画用に最低限を追加（heredocは使わない）
+          python -c "import sys, subprocess; subprocess.check_call([sys.executable,'-m','pip','install','pandas','matplotlib'])"
 
       - name: Verify inputs & files
         run: |
@@ -106,7 +103,7 @@ PY
           echo "=== Generate ${LABEL} intraday snapshot ==="
           echo "VALUE_TYPE=${VALUE_TYPE} (default=${VALUE_TYPE_DEFAULT})"
 
-          # 一部スクリプトは --snapshot-png を未サポートのため付けない
+          # 生成（--snapshot-png は未サポートの実装があるため付けない）
           python scripts/make_intraday_post.py \
             --index-key "${INDEX_KEY}" \
             --csv "${CSV}" \
@@ -120,7 +117,7 @@ PY
             --dt-col        "${DT_COL}" \
             --value-type    "${VALUE_TYPE}"
 
-          # フォールバック: PNG が無ければ簡易チャートを生成
+          # PNG が無い場合のフォールバック（簡易プロット）
           if [ ! -f "${SNAPSHOT_PNG}" ]; then
             echo "[fallback] ${SNAPSHOT_PNG} を生成します"
             python - <<'PY'
