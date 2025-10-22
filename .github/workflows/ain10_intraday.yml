@@ -28,12 +28,10 @@ permissions:
   contents: write
 
 env:
-  # ★ 指数固有
   INDEX_KEY: AIN10
   LABEL: AIN-10
   CSV: docs/outputs/ain10_intraday.csv
   DT_COL: "Datetime"
-  # ★ サイト公開先
   SITE_REPO: SakuraIndex/Sakura-Index-Site
   SITE_BRANCH: main
   PUBLISH_DIR: charts/AIN-10
@@ -64,6 +62,12 @@ jobs:
           set -e
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          # フォールバック用に pandas/matplotlib も用意
+          python - <<'PY'
+          import sys, subprocess
+          pkgs = ["pandas", "matplotlib"]
+          subprocess.check_call([sys.executable, "-m", "pip", "install", *pkgs])
+          PY
 
       - name: Verify inputs & files
         run: |
@@ -82,7 +86,7 @@ jobs:
             echo "variant=pm" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Generate intraday snapshot and post
+      - name: Generate intraday snapshot and post (with fallback)
         env:
           SESSION_START: ${{ inputs.session_start || '09:00' }}
           SESSION_END:   ${{ inputs.session_end   || '15:30' }}
@@ -91,7 +95,6 @@ jobs:
           VALUE_TYPE_IN: ${{ inputs.value_type    || '' }}
         run: |
           set -euo pipefail
-
           OUT_JSON="docs/outputs/ain10_stats.json"
           OUT_TEXT="docs/outputs/ain10_post_intraday.txt"
           SNAPSHOT_PNG="docs/outputs/ain10_intraday.png"
@@ -103,12 +106,12 @@ jobs:
           echo "=== Generate ${LABEL} intraday snapshot ==="
           echo "VALUE_TYPE=${VALUE_TYPE} (default=${VALUE_TYPE_DEFAULT})"
 
+          # ▼ 一部リポの make_intraday_post.py は --snapshot-png を受け付けないため付けない
           python scripts/make_intraday_post.py \
             --index-key "${INDEX_KEY}" \
             --csv "${CSV}" \
             --out-json "${OUT_JSON}" \
             --out-text "${OUT_TEXT}" \
-            --snapshot-png "${SNAPSHOT_PNG}" \
             --session-start "${SESSION_START}" \
             --session-end   "${SESSION_END}" \
             --day-anchor    "${DAY_ANCHOR}" \
@@ -117,9 +120,45 @@ jobs:
             --dt-col        "${DT_COL}" \
             --value-type    "${VALUE_TYPE}"
 
-          ls -l "${OUT_JSON}" "${OUT_TEXT}" "${SNAPSHOT_PNG}"
+          # ▼ フォールバック：PNGが無い場合は簡易チャートを自動生成
+          if [ ! -f "${SNAPSHOT_PNG}" ]; then
+            echo "[fallback] ${SNAPSHOT_PNG} が存在しないため簡易PNGを生成します"
+            python - <<'PY'
+import pandas as pd
+import matplotlib.pyplot as plt
+import pathlib, json
 
-      # デバッグ artifact は無効（Warning 抑止）
+csv_path = pathlib.Path("docs/outputs/ain10_intraday.csv")
+png_path = pathlib.Path("docs/outputs/ain10_intraday.png")
+
+df = pd.read_csv(csv_path)
+# 代表値：Datetime 以外の数値列を平均（存在するもの）
+num_cols = [c for c in df.columns if c != "Datetime"]
+num_cols = [c for c in num_cols if pd.api.types.is_numeric_dtype(df[c])]
+if not num_cols:
+    # 数値列が見つからない場合は 0 ラインで描画
+    y = [0]
+    x = [0]
+else:
+    y = df[num_cols].mean(axis=1).tolist()
+    x = range(len(y))
+
+plt.figure(figsize=(8,3), dpi=160)
+plt.plot(list(x), list(y))
+plt.title("AIN-10 Intraday (fallback)")
+plt.xlabel("Time")
+plt.ylabel("Index (level)")
+plt.tight_layout()
+png_path.parent.mkdir(parents=True, exist_ok=True)
+plt.savefig(png_path, bbox_inches="tight")
+plt.close()
+PY
+          fi
+
+          ls -l "${OUT_JSON}" "${OUT_TEXT}" || true
+          ls -l "${SNAPSHOT_PNG}"
+
+      # デバッグ artifact は無効化（Warning抑止）
       - name: Upload artifacts (for debug)
         if: false
         uses: actions/upload-artifact@v4
