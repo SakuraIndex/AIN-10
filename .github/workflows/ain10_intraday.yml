@@ -20,7 +20,7 @@ on:
         required: true
         default: "prev_close"
       value_type:
-        description: "ratio | percent (override default)"
+        description: "ratio | percent (空なら既定を使用)"
         required: false
         default: ""
 
@@ -62,12 +62,11 @@ jobs:
           set -e
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-          # フォールバック用に pandas/matplotlib も用意
+          # フォールバック描画用
           python - <<'PY'
-          import sys, subprocess
-          pkgs = ["pandas", "matplotlib"]
-          subprocess.check_call([sys.executable, "-m", "pip", "install", *pkgs])
-          PY
+import sys, subprocess
+subprocess.check_call([sys.executable, "-m", "pip", "install", "pandas", "matplotlib"])
+PY
 
       - name: Verify inputs & files
         run: |
@@ -88,13 +87,14 @@ jobs:
 
       - name: Generate intraday snapshot and post (with fallback)
         env:
-          SESSION_START: ${{ inputs.session_start || '09:00' }}
-          SESSION_END:   ${{ inputs.session_end   || '15:30' }}
-          DAY_ANCHOR:    ${{ inputs.day_anchor    || '09:00' }}
-          BASIS:         ${{ inputs.basis         || 'prev_close' }}
-          VALUE_TYPE_IN: ${{ inputs.value_type    || '' }}
+          SESSION_START: ${{ inputs.session_start }}
+          SESSION_END:   ${{ inputs.session_end }}
+          DAY_ANCHOR:    ${{ inputs.day_anchor }}
+          BASIS:         ${{ inputs.basis }}
+          VALUE_TYPE_IN: ${{ inputs.value_type }}
         run: |
           set -euo pipefail
+
           OUT_JSON="docs/outputs/ain10_stats.json"
           OUT_TEXT="docs/outputs/ain10_post_intraday.txt"
           SNAPSHOT_PNG="docs/outputs/ain10_intraday.png"
@@ -106,7 +106,7 @@ jobs:
           echo "=== Generate ${LABEL} intraday snapshot ==="
           echo "VALUE_TYPE=${VALUE_TYPE} (default=${VALUE_TYPE_DEFAULT})"
 
-          # ▼ 一部リポの make_intraday_post.py は --snapshot-png を受け付けないため付けない
+          # 一部スクリプトは --snapshot-png を未サポートのため付けない
           python scripts/make_intraday_post.py \
             --index-key "${INDEX_KEY}" \
             --csv "${CSV}" \
@@ -120,30 +120,28 @@ jobs:
             --dt-col        "${DT_COL}" \
             --value-type    "${VALUE_TYPE}"
 
-          # ▼ フォールバック：PNGが無い場合は簡易チャートを自動生成
+          # フォールバック: PNG が無ければ簡易チャートを生成
           if [ ! -f "${SNAPSHOT_PNG}" ]; then
-            echo "[fallback] ${SNAPSHOT_PNG} が存在しないため簡易PNGを生成します"
+            echo "[fallback] ${SNAPSHOT_PNG} を生成します"
             python - <<'PY'
 import pandas as pd
 import matplotlib.pyplot as plt
-import pathlib, json
+import pathlib
 
 csv_path = pathlib.Path("docs/outputs/ain10_intraday.csv")
 png_path = pathlib.Path("docs/outputs/ain10_intraday.png")
 
 df = pd.read_csv(csv_path)
-# 代表値：Datetime 以外の数値列を平均（存在するもの）
 num_cols = [c for c in df.columns if c != "Datetime"]
 num_cols = [c for c in num_cols if pd.api.types.is_numeric_dtype(df[c])]
 if not num_cols:
-    # 数値列が見つからない場合は 0 ラインで描画
     y = [0]
     x = [0]
 else:
     y = df[num_cols].mean(axis=1).tolist()
     x = range(len(y))
 
-plt.figure(figsize=(8,3), dpi=160)
+plt.figure(figsize=(8, 3), dpi=160)
 plt.plot(list(x), list(y))
 plt.title("AIN-10 Intraday (fallback)")
 plt.xlabel("Time")
@@ -158,7 +156,7 @@ PY
           ls -l "${OUT_JSON}" "${OUT_TEXT}" || true
           ls -l "${SNAPSHOT_PNG}"
 
-      # デバッグ artifact は無効化（Warning抑止）
+      # デバッグ用 artifact は無効化（Warning 抑止）
       - name: Upload artifacts (for debug)
         if: false
         uses: actions/upload-artifact@v4
