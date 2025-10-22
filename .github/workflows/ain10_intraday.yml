@@ -3,65 +3,43 @@ name: AIN10 • intraday + publish (JST 09:00–15:30)
 on:
   workflow_dispatch:
     inputs:
-      session_start:
-        description: "Session start (HH:MM JST)"
-        required: true
-        default: "09:00"
-      session_end:
-        description: "Session end (HH:MM JST)"
-        required: true
-        default: "15:30"
-      day_anchor:
-        description: "Day anchor time (HH:MM JST)"
-        required: true
-        default: "09:00"
-      basis:
-        description: "Return basis label"
-        required: true
-        default: "prev_close"
-      value_type:
-        description: "Value type: ratio | percent (blank = script default)"
-        required: false
-        default: ""
-
+      session_start: { description: "Session start (HH:MM JST)", required: true, default: "09:00" }
+      session_end:   { description: "Session end (HH:MM JST)",   required: true, default: "15:30" }
+      day_anchor:    { description: "Day anchor time (HH:MM JST)", required: true, default: "09:00" }
+      basis:         { description: "Return basis label", required: true, default: "prev_close" }
+      value_type:    { description: "Value type: ratio | percent", required: true, default: "percent" }
   schedule:
-    - cron: "35 2 * * 1-5"   # JST 11:35
-    - cron: "35 6 * * 1-5"   # JST 15:35
+    - cron: "35 2 * * 1-5"
+    - cron: "35 6 * * 1-5"
 
 permissions:
   contents: write
 
 env:
   INDEX_KEY: AIN10
-  LABEL: AIN10
+  LABEL: AIN-10
   CSV: docs/outputs/ain10_intraday.csv
-  DT_COL: "Datetime"
   OUT_JSON: docs/outputs/ain10_stats.json
   OUT_TEXT: docs/outputs/ain10_post_intraday.txt
   SNAPSHOT_PNG: docs/outputs/ain10_intraday.png
-
+  DT_COL: "Datetime"
   SITE_REPO: SakuraIndex/Sakura-Index-Site
   SITE_BRANCH: main
+  PUBLISH_DIR: charts/${{ env.INDEX_KEY }}
+
+concurrency:
+  group: intraday-${{ github.ref }}-${{ env.INDEX_KEY }}
+  cancel-in-progress: false
 
 jobs:
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 12
-
-    concurrency:
-      group: intraday-${{ github.ref }}-AIN10
-      cancel-in-progress: false
-
     steps:
-      - name: Checkout (this repo)
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
+      - uses: actions/checkout@v4
 
-      - name: Setup Python 3.11
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
 
       - name: Install dependencies
         run: |
@@ -71,59 +49,52 @@ jobs:
       - name: Verify inputs & files
         run: |
           set -e
-          test -f scripts/make_intraday_post.py || (echo "Missing scripts/make_intraday_post.py" && exit 1)
-          test -f "${CSV}" || (echo "Missing CSV: ${CSV}" && exit 1)
-          echo "OK: ${CSV}"
+          test -f scripts/make_intraday_post.py
+          test -f "${CSV}"
 
-      - name: Generate intraday snapshot and post (with fallback)
+      - name: Decide publish variant (AM / PM)
+        shell: bash
+        env: { RUN_SCHEDULE: ${{ github.event.schedule }} }
+        run: |
+          if [[ "${RUN_SCHEDULE}" == "35 2 * * 1-5" ]]; then
+            echo "PUBLISH_VARIANT=am" >> "$GITHUB_ENV"
+          else
+            echo "PUBLISH_VARIANT=pm" >> "$GITHUB_ENV"
+          fi
+          echo "VALUE_TYPE=${{ inputs.value_type || 'percent' }}" >> "$GITHUB_ENV"
+
+      - name: Generate intraday snapshot and post
         env:
           SESSION_START: ${{ inputs.session_start || '09:00' }}
           SESSION_END:   ${{ inputs.session_end   || '15:30' }}
           DAY_ANCHOR:    ${{ inputs.day_anchor    || '09:00' }}
           BASIS:         ${{ inputs.basis         || 'prev_close' }}
-          VALUE_TYPE:    ${{ inputs.value_type    || '' }}
+          VALUE_TYPE:    ${{ env.VALUE_TYPE }}
         run: |
           set -euo pipefail
-          echo "=== Generate ${INDEX_KEY} intraday snapshot ==="
+          python scripts/make_intraday_post.py \
+            --index-key "${INDEX_KEY}" \
+            --csv "${CSV}" \
+            --out-json "${OUT_JSON}" \
+            --out-text "${OUT_TEXT}" \
+            --snapshot-png "${SNAPSHOT_PNG}" \
+            --session-start "${SESSION_START}" \
+            --session-end "${SESSION_END}" \
+            --day-anchor "${DAY_ANCHOR}" \
+            --basis "${BASIS}" \
+            --value-type "${VALUE_TYPE}" \
+            --dt-col "${DT_COL}" \
+            --label "${LABEL}"
 
-          # 拡張引数対応かどうかを --help で判定
-          if python scripts/make_intraday_post.py -h | grep -q -- '--session-start'; then
-            echo "[info] extended CLI detected -> using full arguments"
-            VT_ARGS=""
-            if [ -n "${VALUE_TYPE}" ]; then VT_ARGS="--value-type ${VALUE_TYPE}"; fi
-
-            python scripts/make_intraday_post.py \
-              --index-key "${INDEX_KEY}" \
-              --csv "${CSV}" \
-              --out-json "${OUT_JSON}" \
-              --out-text "${OUT_TEXT}" \
-              --snapshot-png "${SNAPSHOT_PNG}" \
-              --session-start "${SESSION_START}" \
-              --session-end "${SESSION_END}" \
-              --day-anchor "${DAY_ANCHOR}" \
-              --basis "${BASIS}" \
-              --dt-col "${DT_COL}" \
-              --label "${LABEL}" \
-              ${VT_ARGS}
-          else
-            echo "[warn] legacy CLI detected -> falling back to minimal arguments"
-            # 最小引数で実行（古い版は環境変数や内部デフォルトで描画）
-            python scripts/make_intraday_post.py \
-              --index-key "${INDEX_KEY}" \
-              --csv "${CSV}" \
-              --out-json "${OUT_JSON}" \
-              --out-text "${OUT_TEXT}"
-          fi
-
-      - name: Upload artifacts (for debug)
+      - name: Upload artifacts (debug)
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: ain10_intraday_artifacts
           path: |
-            ${{ env.OUT_JSON }}
-            ${{ env.OUT_TEXT }}
-            ${{ env.SNAPSHOT_PNG }}
+            ${OUT_TEXT}
+            ${OUT_JSON}
+            ${SNAPSHOT_PNG}
           if-no-files-found: ignore
           retention-days: 3
 
@@ -131,40 +102,27 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: ${{ env.SITE_REPO }}
-          ref: ${{ env.SITE_BRANCH }}
           token: ${{ secrets.SITE_PAT }}
+          ref: ${{ env.SITE_BRANCH }}
           path: site
 
-      - name: Copy snapshot files into site tree (with PNG auto-detect)
+      - name: Copy snapshot files into site tree (with AM/PM & long-term)
         run: |
           set -e
-          PUBLISH_DIR="docs/charts/${INDEX_KEY}"
           mkdir -p "site/${PUBLISH_DIR}"
 
-          # PNG が既定場所に無ければ自動検出
-          PNG_PATH="${SNAPSHOT_PNG}"
-          if [ ! -f "${PNG_PATH}" ]; then
-            CANDIDATE=$(ls docs/outputs/*intraday*.png 2>/dev/null | head -n1 || true)
-            if [ -n "${CANDIDATE}" ]; then
-              echo "[warn] ${PNG_PATH} not found. Using detected: ${CANDIDATE}"
-              PNG_PATH="${CANDIDATE}"
-            else
-              echo "[warn] intraday PNG not found. Skipping PNG publish."
-              PNG_PATH=""
-            fi
+          if [ "${PUBLISH_VARIANT}" = "am" ]; then
+            cp -f "${SNAPSHOT_PNG}" "site/${PUBLISH_DIR}/intraday_am.png"
+          else
+            cp -f "${SNAPSHOT_PNG}" "site/${PUBLISH_DIR}/intraday.png"
           fi
 
-          # ファイルがあればコピー
-          if [ -n "${PNG_PATH}" ] && [ -f "${PNG_PATH}" ]; then
-            cp -f "${PNG_PATH}" "site/${PUBLISH_DIR}/intraday.png"
-          fi
-          if [ -f "${OUT_TEXT}" ]; then
-            cp -f "${OUT_TEXT}" "site/${PUBLISH_DIR}/post_intraday.txt"
-          fi
-          if [ -f "${OUT_JSON}" ]; then
-            cp -f "${OUT_JSON}" "site/${PUBLISH_DIR}/stats.json"
-          fi
-          ls -al "site/${PUBLISH_DIR}" || true
+          for T in 7d 1m 1y; do
+            F="docs/outputs/ain10_${T}.png"
+            if [ -f "${F}" ]; then
+              cp -f "${F}" "site/${PUBLISH_DIR}/${T}.png"
+            fi
+          done
 
       - name: Commit & push site charts
         working-directory: site
@@ -172,10 +130,10 @@ jobs:
           set -e
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add docs/charts/${INDEX_KEY}/intraday.png docs/charts/${INDEX_KEY}/post_intraday.txt docs/charts/${INDEX_KEY}/stats.json || true
+          git add "${PUBLISH_DIR}" || true
           if ! git diff --cached --quiet; then
-            git commit -m "chore(charts): update ${INDEX_KEY} intraday"
-            git push origin "${{ env.SITE_BRANCH }}"
+            git commit -m "publish(${ {env.INDEX_KEY} }): intraday ${PUBLISH_VARIANT}"
+            git push origin "${SITE_BRANCH}"
           else
             echo "No site changes."
           fi
