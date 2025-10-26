@@ -30,12 +30,12 @@ env:
   DT_COL: Datetime
   BASIS: prev_close
 
-  # このリポ内の一時出力（名前は任意。サイト反映時に正規名へリネーム）
+  # このリポ内の一時出力（名前は任意）
   OUT_JSON: docs/charts/ain10_stats.json
   OUT_TEXT: docs/charts/ain10_post_intraday.txt
   SNAPSHOT_PNG: docs/charts/ain10_1d.png
 
-  # 公開サイト（フォルダは AIN10 ← ハイフンなし）
+  # 公開サイト
   SITE_REPO: SakuraIndex/Sakura-Index-Site
   SITE_BRANCH: main
   PUBLISH_DIR: docs/charts/AIN10
@@ -79,14 +79,9 @@ jobs:
           set -e
           test -f "${CSV}" || (echo "❌ Missing CSV: ${CSV}" && exit 1)
           test -f scripts/make_intraday_post.py || (echo "❌ Missing script: scripts/make_intraday_post.py" && exit 1)
-
-      - name: Prepare output directories
-        shell: bash
-        run: |
-          set -e
           mkdir -p "$(dirname "${OUT_JSON}")" "$(dirname "${OUT_TEXT}")" "$(dirname "${SNAPSHOT_PNG}")"
 
-      - name: Generate intraday snapshot and post
+      - name: Generate intraday snapshot and post (new CLI → legacy fallback)
         shell: bash
         env:
           SESSION_START: ${{ inputs.session_start }}
@@ -96,19 +91,77 @@ jobs:
         run: |
           set -euo pipefail
           echo "=== Generate ${INDEX_KEY} intraday snapshot ==="
-          python scripts/make_intraday_post.py \
-            --index-key "${INDEX_KEY}" \
-            --csv "${CSV}" \
-            --out-json "${OUT_JSON}" \
-            --out-text "${OUT_TEXT}" \
-            --snapshot-png "${SNAPSHOT_PNG}" \
-            --session-start "${SESSION_START}" \
-            --session-end "${SESSION_END}" \
-            --day-anchor "${DAY_ANCHOR}" \
-            --basis "${BASIS}" \
-            --label "${LABEL}" \
-            --dt-col "${DT_COL}" \
-            --value-type "${VALUE_TYPE}"
+
+          # 1) 新CLIトライ
+          if python scripts/make_intraday_post.py \
+              --index-key "${INDEX_KEY}" \
+              --csv "${CSV}" \
+              --out-json "${OUT_JSON}" \
+              --out-text "${OUT_TEXT}" \
+              --snapshot-png "${SNAPSHOT_PNG}" \
+              --session-start "${SESSION_START}" \
+              --session-end "${SESSION_END}" \
+              --day-anchor "${DAY_ANCHOR}" \
+              --basis "${BASIS}" \
+              --label "${LABEL}" \
+              --dt-col "${DT_COL}" \
+              --value-type "${VALUE_TYPE}"; then
+            echo "[ok] new CLI finished."
+          else
+            echo "[fallback] try legacy CLI (reduced options)"
+            # 2) 旧CLI（最小引数）
+            python scripts/make_intraday_post.py \
+              --index-key "${INDEX_KEY}" \
+              --csv "${CSV}" \
+              --out-json "${OUT_JSON}" \
+              --out-text "${OUT_TEXT}"
+          fi
+
+          # 3) PNGが無いなら簡易PNGを作る
+          if [ ! -f "${SNAPSHOT_PNG}" ]; then
+            echo "[fallback] create simple PNG → ${SNAPSHOT_PNG}"
+            python - <<'PY'
+import pandas as pd, matplotlib.pyplot as plt, pathlib as P
+csv = P.Path("${CSV}"); png = P.Path("${SNAPSHOT_PNG}")
+df = pd.read_csv(csv)
+# Datetime 以外の数値列の平均を描く（暫定）
+cols = [c for c in df.columns if c.lower()!="datetime"]
+y = df[cols].mean(axis=1) if cols else pd.Series([0])
+plt.figure(figsize=(12,4), dpi=160)
+plt.plot(range(len(y)), y)
+plt.title("AIN-10 Intraday (fallback)")
+plt.tight_layout()
+png.parent.mkdir(parents=True, exist_ok=True)
+plt.savefig(png)
+PY
+          fi
+
+          # 4) JSON 正規化（pct_intraday は ratio=小数へ揃える）
+          python - <<'PY'
+import json, pathlib, datetime
+p = pathlib.Path("${OUT_JSON}")
+if p.exists():
+    data = json.loads(p.read_text(encoding="utf-8"))
+    # キーの標準化
+    data["index_key"] = data.get("index_key") or "AIN-10"
+    data["label"] = data.get("label") or "AIN-10"
+    # pct_intraday を ratio へ（>1 or <-1 を%とみなして /100）
+    v = data.get("pct_intraday", None)
+    try:
+        v = float(v)
+        if abs(v) > 1.0:   # 例: +1.46 → 0.0146
+            v = round(v/100.0, 6)
+        data["pct_intraday"] = v
+    except Exception:
+        data["pct_intraday"] = None
+    # session/basis/updated_at の補完
+    data.setdefault("basis", "${BASIS}")
+    data.setdefault("session", {"start":"${{ inputs.session_start }}","end":"${{ inputs.session_end }}","anchor":"${{ inputs.day_anchor }}"})
+    data.setdefault("updated_at", datetime.datetime.now(datetime.UTC).isoformat())
+    p.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+else:
+    raise SystemExit("JSON not found for normalization: " + str(p))
+PY
 
       - name: Upload artifacts (for debug)
         if: always()
@@ -129,13 +182,12 @@ jobs:
           path: site
           fetch-depth: 0
 
-      - name: Copy snapshot files into site tree (use site-expected names)
+      - name: Copy snapshot files into site tree (site-expected names)
         shell: bash
         run: |
           set -euo pipefail
           dst="site/${PUBLISH_DIR}"
           mkdir -p "${dst}"
-          # サイト側は stats.json / intraday.png / post_intraday.txt を読む
           cp -f "${OUT_JSON}"     "${dst}/stats.json"
           cp -f "${OUT_TEXT}"     "${dst}/post_intraday.txt"
           cp -f "${SNAPSHOT_PNG}" "${dst}/intraday.png"
@@ -156,11 +208,3 @@ jobs:
             git commit -m "Update AIN-10 intraday charts ($(date '+%Y-%m-%d %H:%M JST'))"
             git push origin "${SITE_BRANCH}"
           fi
-
-      - name: Post Setup Python 3.11
-        if: always()
-        run: python --version
-
-      - name: Post Checkout (this repo)
-        if: always()
-        run: echo "✅ Workflow finished."
