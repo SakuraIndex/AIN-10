@@ -1,4 +1,4 @@
-name: AIN-10 • intraday + publish (JST 09:00–15:30)
+name: "AIN-10 • intraday + publish (JST 09:00–15:30)"
 
 on:
   workflow_dispatch:
@@ -15,29 +15,34 @@ on:
         description: "Day anchor time (HH:MM JST)"
         required: true
         default: "09:00"
-      basis:
-        description: "Return basis label (unused by legacy CLI)"
-        required: true
-        default: "prev_close"
       value_type:
-        description: "ratio | percent (unused by legacy CLI)"
-        required: false
-        default: ""
+        description: "auto | percent | ratio"
+        required: true
+        default: "auto"
 
 permissions:
   contents: write
 
 env:
-  INDEX_KEY: AIN10
+  INDEX_KEY: AIN-10
   LABEL: AIN-10
   CSV: docs/outputs/ain10_intraday.csv
-  DT_COL: "Datetime"
+  DT_COL: Datetime
+  BASIS: prev_close
+
+  # このリポ内の一時出力（名前は任意。サイト反映時に正規名へリネーム）
+  OUT_JSON: docs/charts/ain10_stats.json
+  OUT_TEXT: docs/charts/ain10_post_intraday.txt
+  SNAPSHOT_PNG: docs/charts/ain10_1d.png
+
+  # 公開サイト（フォルダは AIN10 ← ハイフンなし）
   SITE_REPO: SakuraIndex/Sakura-Index-Site
   SITE_BRANCH: main
-  PUBLISH_DIR: charts/AIN-10
+  PUBLISH_DIR: docs/charts/AIN10
+  PUBLISH_TOKEN: ${{ secrets.SITE_PUBLISH_TOKEN || secrets.SITE_PAT || secrets.GITHUB_TOKEN }}
 
 concurrency:
-  group: intraday-${{ github.ref }}--AIN10
+  group: "intraday-ain10-${{ github.ref }}"
   cancel-in-progress: false
 
 jobs:
@@ -57,99 +62,105 @@ jobs:
           python-version: "3.11"
 
       - name: Install dependencies
-        run: |
-          set -e
-          python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-          # フォールバック描画用の最低限
-          python - <<'PY'
-          import sys, subprocess
-          subprocess.check_call([sys.executable, "-m", "pip", "install", "pandas", "matplotlib"])
-          PY
-
-      - name: Verify inputs & files
-        run: |
-          set -e
-          test -f "${CSV}" || (echo "Missing CSV: ${CSV}" && exit 1)
-          test -f scripts/make_intraday_post.py || (echo "Missing script: scripts/make_intraday_post.py" && exit 1)
-
-      - name: Decide publish variant (AM / PM)
-        id: ampm
         shell: bash
         run: |
-          H=$(TZ=Asia/Tokyo date +%H)
-          if [ "$H" -lt 12 ]; then
-            echo "variant=am" >> "$GITHUB_OUTPUT"
+          set -e
+          if [ -f requirements.txt ]; then
+            python -m pip install -U pip
+            python -m pip install -r requirements.txt
           else
-            echo "variant=pm" >> "$GITHUB_OUTPUT"
+            python -m pip install -U pip
+            python -m pip install pandas matplotlib
           fi
 
-      - name: Generate intraday snapshot and post (with fallback)
+      - name: Verify inputs & files
+        shell: bash
+        run: |
+          set -e
+          test -f "${CSV}" || (echo "❌ Missing CSV: ${CSV}" && exit 1)
+          test -f scripts/make_intraday_post.py || (echo "❌ Missing script: scripts/make_intraday_post.py" && exit 1)
+
+      - name: Prepare output directories
+        shell: bash
+        run: |
+          set -e
+          mkdir -p "$(dirname "${OUT_JSON}")" "$(dirname "${OUT_TEXT}")" "$(dirname "${SNAPSHOT_PNG}")"
+
+      - name: Generate intraday snapshot and post
+        shell: bash
+        env:
+          SESSION_START: ${{ inputs.session_start }}
+          SESSION_END:   ${{ inputs.session_end }}
+          DAY_ANCHOR:    ${{ inputs.day_anchor }}
+          VALUE_TYPE:    ${{ inputs.value_type }}
         run: |
           set -euo pipefail
-
-          OUT_JSON="docs/outputs/ain10_stats.json"
-          OUT_TEXT="docs/outputs/ain10_post_intraday.txt"
-          SNAPSHOT_PNG="docs/outputs/ain10_intraday.png"
-          mkdir -p docs/outputs
-
-          echo "=== Generate ${LABEL} intraday snapshot ==="
-          # ※ AIN-10 の make_intraday_post.py は legacy CLI のため最小セットのみ渡す
+          echo "=== Generate ${INDEX_KEY} intraday snapshot ==="
           python scripts/make_intraday_post.py \
             --index-key "${INDEX_KEY}" \
             --csv "${CSV}" \
             --out-json "${OUT_JSON}" \
-            --out-text "${OUT_TEXT}"
+            --out-text "${OUT_TEXT}" \
+            --snapshot-png "${SNAPSHOT_PNG}" \
+            --session-start "${SESSION_START}" \
+            --session-end "${SESSION_END}" \
+            --day-anchor "${DAY_ANCHOR}" \
+            --basis "${BASIS}" \
+            --label "${LABEL}" \
+            --dt-col "${DT_COL}" \
+            --value-type "${VALUE_TYPE}"
 
-          # PNG がない場合はフォールバックで作成
-          if [ ! -f "${SNAPSHOT_PNG}" ]; then
-            echo "[fallback] ${SNAPSHOT_PNG} を生成します"
-            python scripts/plot_fallback.py \
-              --csv "${CSV}" \
-              --out "${SNAPSHOT_PNG}" \
-              --title "${LABEL} Intraday (fallback)" \
-              --dt-col "${DT_COL}"
-          fi
-
-          ls -l "${OUT_JSON}" "${OUT_TEXT}" || true
-          ls -l "${SNAPSHOT_PNG}"
-
-      # デバッグ artifact は出さない（Warning 抑止）
       - name: Upload artifacts (for debug)
-        if: false
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: ain10_intraday_artifacts
           path: |
-            docs/outputs/ain10_stats.json
-            docs/outputs/ain10_post_intraday.txt
-            docs/outputs/ain10_intraday.png
+            ${{ env.OUT_TEXT }}
+            ${{ env.SNAPSHOT_PNG }}
+            ${{ env.OUT_JSON }}
 
       - name: Checkout site repo (for publishing)
         uses: actions/checkout@v4
         with:
           repository: ${{ env.SITE_REPO }}
-          token: ${{ secrets.SITE_PAT }}
           ref: ${{ env.SITE_BRANCH }}
+          token: ${{ env.PUBLISH_TOKEN }}
           path: site
+          fetch-depth: 0
 
-      - name: Copy snapshot files into site tree
+      - name: Copy snapshot files into site tree (use site-expected names)
+        shell: bash
         run: |
-          set -e
-          mkdir -p "site/${PUBLISH_DIR}"
-          cp -f docs/outputs/ain10_intraday.png "site/${PUBLISH_DIR}/intraday.png"
-          cp -f docs/outputs/ain10_stats.json   "site/${PUBLISH_DIR}/stats.json"
+          set -euo pipefail
+          dst="site/${PUBLISH_DIR}"
+          mkdir -p "${dst}"
+          # サイト側は stats.json / intraday.png / post_intraday.txt を読む
+          cp -f "${OUT_JSON}"     "${dst}/stats.json"
+          cp -f "${OUT_TEXT}"     "${dst}/post_intraday.txt"
+          cp -f "${SNAPSHOT_PNG}" "${dst}/intraday.png"
+          echo "📁 Copied to ${dst}:"
+          ls -l "${dst}"
 
       - name: Commit & push site charts
         working-directory: site
+        shell: bash
         run: |
-          set -e
+          set -euo pipefail
+          git config user.email "actions@github.com"
           git config user.name  "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add "${PUBLISH_DIR}/intraday.png" "${PUBLISH_DIR}/stats.json"
+          git add -A
           if git diff --cached --quiet; then
-            echo "No site changes."
-            exit 0
+            echo "No changes to commit."
+          else
+            git commit -m "Update AIN-10 intraday charts ($(date '+%Y-%m-%d %H:%M JST'))"
+            git push origin "${SITE_BRANCH}"
           fi
-          git commit -m "chore(site): update AIN-10 intraday snapshot & stats"
-          git push origin "${SITE_BRANCH}"
+
+      - name: Post Setup Python 3.11
+        if: always()
+        run: python --version
+
+      - name: Post Checkout (this repo)
+        if: always()
+        run: echo "✅ Workflow finished."
