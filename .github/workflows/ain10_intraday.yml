@@ -24,19 +24,16 @@ permissions:
   contents: write
 
 env:
-  # 主要設定
-  INDEX_KEY: AIN10           # 列名はハイフン無しを想定（CSVに合わせて調整）
+  INDEX_KEY: AIN10
   LABEL: AIN-10
   CSV: docs/outputs/ain10_intraday.csv
   DT_COL: Datetime
   BASIS: prev_close
 
-  # このリポ内の生成物（サイトへコピー時に正規名へリネーム）
   OUT_JSON: docs/charts/ain10_stats.json
   OUT_TEXT: docs/charts/ain10_post_intraday.txt
   SNAPSHOT_PNG: docs/charts/ain10_1d.png
 
-  # 公開サイト
   SITE_REPO: SakuraIndex/Sakura-Index-Site
   SITE_BRANCH: main
   PUBLISH_DIR: docs/charts/AIN10
@@ -50,7 +47,6 @@ jobs:
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 12
-
     steps:
       - name: Checkout (this repo)
         uses: actions/checkout@v4
@@ -78,8 +74,8 @@ jobs:
         shell: bash
         run: |
           set -e
-          test -f "${CSV}" || (echo "❌ Missing CSV: ${CSV}" && exit 1)
-          test -f scripts/make_intraday_post.py || (echo "❌ Missing script: scripts/make_intraday_post.py" && exit 1)
+          test -f "${CSV}" || { echo "❌ Missing CSV: ${CSV}"; exit 1; }
+          test -f scripts/make_intraday_post.py || { echo "❌ Missing script: scripts/make_intraday_post.py"; exit 1; }
 
       - name: Prepare output directories
         shell: bash
@@ -87,13 +83,13 @@ jobs:
           set -e
           mkdir -p "$(dirname "${OUT_JSON}")" "$(dirname "${OUT_TEXT}")" "$(dirname "${SNAPSHOT_PNG}")"
 
-      - name: Generate intraday snapshot and post (new CLI → legacy fallback)
+      - name: Generate intraday snapshot and post (new → legacy fallback)
+        shell: bash
         env:
           SESSION_START: ${{ inputs.session_start }}
           SESSION_END:   ${{ inputs.session_end }}
           DAY_ANCHOR:    ${{ inputs.day_anchor }}
           VALUE_TYPE:    ${{ inputs.value_type }}
-        shell: bash
         run: |
           set -euo pipefail
           echo "=== Generate ${INDEX_KEY} intraday snapshot ==="
@@ -110,10 +106,9 @@ jobs:
               --label         "${LABEL}" \
               --dt-col        "${DT_COL}" \
               --value-type    "${VALUE_TYPE}"; then
-            echo "[ok] new-CLI finished."
+            echo "[ok] new CLI finished"
           else
-            echo "[fallback] try legacy CLI (reduced options)"
-            # 旧版スクリプト想定：未知オプションを渡さない
+            echo "[fallback] legacy mode"
             python scripts/make_intraday_post.py \
               --index-key "${INDEX_KEY}" \
               --csv "${CSV}" \
@@ -121,32 +116,57 @@ jobs:
               --out-text "${OUT_TEXT}" || true
           fi
 
-      # ===== PNG が無ければ簡易 PNG（ヒアドキュメント不使用・タブ無し） =====
       - name: Fallback: create simple PNG if missing
-        if: ${{ always() }}
         shell: bash
         run: |
           set -euo pipefail
           if [ ! -s "${SNAPSHOT_PNG}" ]; then
             echo "[fallback] create simple PNG -> ${SNAPSHOT_PNG}"
-            python -c "import pandas as pd, matplotlib; matplotlib.use('Agg'); import matplotlib.pyplot as plt; from pathlib import Path; csv=Path('${CSV}'); png=Path('${SNAPSHOT_PNG}'); df=pd.read_csv(csv); cols=[c for c in df.columns if c.lower()!='datetime']; y=(df[cols].mean(axis=1) if cols else pd.Series([0])); plt.figure(figsize=(12,4), dpi=160); plt.plot(range(len(y)), y); plt.title('AIN-10 Intraday (fallback)'); plt.tight_layout(); png.parent.mkdir(parents=True, exist_ok=True); plt.savefig(png)"
+            cat > _fallback_png.py <<'PY'
+import pandas as pd
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from pathlib import Path
+csv = Path("${CSV}")
+png = Path("${SNAPSHOT_PNG}")
+df = pd.read_csv(csv)
+cols = [c for c in df.columns if c.lower() != "datetime"]
+y = (df[cols].mean(axis=1) if cols else pd.Series([0.0]))
+plt.figure(figsize=(12,4), dpi=160)
+plt.plot(range(len(y)), y)
+plt.title("AIN-10 Intraday (fallback)")
+plt.tight_layout()
+png.parent.mkdir(parents=True, exist_ok=True)
+plt.savefig(png)
+PY
+            python _fallback_png.py
           fi
 
-      # ===== JSON 正規化：pct_intraday を ratio(小数)に補正（安全） =====
-      - name: Normalize JSON to ratio (safety)
-        if: ${{ always() }}
+      - name: Normalize JSON to ratio(safety)
         shell: bash
         run: |
           set -euo pipefail
-          python -c "import json, pathlib, datetime; p=pathlib.Path('${OUT_JSON}'); \
-if p.exists(): \
-  d=json.loads(p.read_text(encoding='utf-8')); \
-  v=d.get('pct_intraday'); \
-  d['pct_intraday']=round(float(v)/100.0,6) if isinstance(v,(int,float)) and abs(float(v))>1.0 else v; \
-  d['updated_at']=datetime.datetime.now().astimezone().isoformat(); \
-  p.write_text(json.dumps(d, ensure_ascii=False, indent=2), encoding='utf-8')"
+          if [ -s "${OUT_JSON}" ]; then
+            cat > _normalize_json.py <<'PY'
+import json, datetime, pathlib
+p = pathlib.Path("${OUT_JSON}")
+d = json.loads(p.read_text(encoding="utf-8"))
+v = d.get("pct_intraday")
+try:
+    fv = float(v)
+    # percentが入っていたらratioへ
+    if abs(fv) > 1.0:
+        d["pct_intraday"] = round(fv/100.0, 6)
+except Exception:
+    pass
+d["updated_at"] = datetime.datetime.now().astimezone().isoformat()
+p.write_text(json.dumps(d, ensure_ascii=False, indent=2), encoding="utf-8")
+PY
+            python _normalize_json.py
+          fi
 
-      - name: Upload artifacts (for debug)
+      - name: Upload artifacts (debug)
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -165,17 +185,15 @@ if p.exists(): \
           path: site
           fetch-depth: 0
 
-      - name: Copy snapshot files into site tree (use site-expected names)
+      - name: Copy snapshot files into site tree
         shell: bash
         run: |
           set -euo pipefail
           dst="site/${PUBLISH_DIR}"
           mkdir -p "${dst}"
-          # サイト側は stats.json / intraday.png / post_intraday.txt を参照
           cp -f "${OUT_JSON}"     "${dst}/stats.json"
           cp -f "${OUT_TEXT}"     "${dst}/post_intraday.txt"
           cp -f "${SNAPSHOT_PNG}" "${dst}/intraday.png"
-          echo "📁 Copied to ${dst}:"
           ls -l "${dst}"
 
       - name: Commit & push site charts
