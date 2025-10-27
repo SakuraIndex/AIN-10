@@ -104,26 +104,26 @@ jobs:
           if [ ! -s "${SNAPSHOT_PNG}" ]; then
             echo "[fallback] generating simple PNG → ${SNAPSHOT_PNG}"
             cat > _fallback_png.py <<'PY'
-import os
-from pathlib import Path
-import pandas as pd
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
+            import os
+            from pathlib import Path
+            import pandas as pd
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
 
-csv = Path(os.environ["CSV"])
-png = Path(os.environ["SNAPSHOT_PNG"])
+            csv = Path(os.environ["CSV"])
+            png = Path(os.environ["SNAPSHOT_PNG"])
 
-df = pd.read_csv(csv)
-cols = [c for c in df.columns if c.lower() != "datetime"]
-y = df[cols].mean(axis=1) if cols else pd.Series([0])
-plt.figure(figsize=(12,4), dpi=160)
-plt.plot(y)
-plt.title("AIN-10 Intraday (fallback)")
-plt.tight_layout()
-png.parent.mkdir(parents=True, exist_ok=True)
-plt.savefig(png)
-PY
+            df = pd.read_csv(csv)
+            cols = [c for c in df.columns if c.lower() != "datetime"]
+            y = df[cols].mean(axis=1) if cols else pd.Series([0])
+            plt.figure(figsize=(12,4), dpi=160)
+            plt.plot(y)
+            plt.title("AIN-10 Intraday (fallback)")
+            plt.tight_layout()
+            png.parent.mkdir(parents=True, exist_ok=True)
+            plt.savefig(png)
+            PY
             python _fallback_png.py
           fi
 
@@ -133,27 +133,27 @@ PY
           set -e
           if [ -s "${OUT_JSON}" ]; then
             cat > _normalize_json.py <<'PY'
-import json, os, datetime as dt
-from pathlib import Path
+            import json, os, datetime as dt
+            from pathlib import Path
 
-p = Path(os.environ["OUT_JSON"])
-d = json.loads(p.read_text(encoding="utf-8")) if p.exists() else {}
-v = d.get("pct_intraday")
+            p = Path(os.environ["OUT_JSON"])
+            d = json.loads(p.read_text(encoding="utf-8")) if p.exists() else {}
+            v = d.get("pct_intraday")
 
-fv = None
-try:
-    fv = float(v)
-except Exception:
-    fv = None
+            fv = None
+            try:
+                fv = float(v)
+            except Exception:
+                fv = None
 
-if fv is not None and abs(fv) > 1.0:
-    d["pct_intraday"] = round(fv/100.0, 6)
-elif fv is not None:
-    d["pct_intraday"] = fv
+            if fv is not None and abs(fv) > 1.0:
+                d["pct_intraday"] = round(fv/100.0, 6)
+            elif fv is not None:
+                d["pct_intraday"] = fv
 
-d["updated_at"] = dt.datetime.now().astimezone().isoformat()
-p.write_text(json.dumps(d, ensure_ascii=False, indent=2), encoding="utf-8")
-PY
+            d["updated_at"] = dt.datetime.now().astimezone().isoformat()
+            p.write_text(json.dumps(d, ensure_ascii=False, indent=2), encoding="utf-8")
+            PY
             python _normalize_json.py
           fi
 
