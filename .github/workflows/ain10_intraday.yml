@@ -3,40 +3,39 @@ name: "AIN-10 • intraday + publish (US Market Time)"
 on:
   workflow_dispatch:
     inputs:
+      # 手動実行時に上書きしたい場合だけ指定（JST）
       session_start:
-        description: "US session start (HH:MM JST)"
-        required: true
-        default: "22:30"
+        description: "Session start (HH:MM JST) — 未指定なら米国市場に合わせ自動設定"
+        required: false
+        default: ""
       session_end:
-        description: "US session end (HH:MM JST)"
-        required: true
-        default: "05:00"
-      day_anchor:
-        description: "Anchor time (HH:MM JST)"
-        required: true
-        default: "22:30"
+        description: "Session end (HH:MM JST) — 未指定なら米国市場に合わせ自動設定"
+        required: false
+        default: ""
       value_type:
-        description: "auto | percent | ratio"
-        required: true
+        description: "auto | percent | ratio（CSVの単位判定/指定。既定:auto）"
+        required: false
         default: "auto"
 
 permissions:
   contents: write
 
 env:
-  INDEX_KEY: AIN10
+  INDEX_KEY: AIN-10
   LABEL: AIN-10
   CSV: docs/outputs/ain10_intraday.csv
   DT_COL: Datetime
   BASIS: prev_close
 
+  # 生成物（このリポ内。任意名でOK）
   OUT_JSON: docs/charts/ain10_stats.json
   OUT_TEXT: docs/charts/ain10_post_intraday.txt
   SNAPSHOT_PNG: docs/charts/ain10_1d.png
 
+  # 公開サイト
   SITE_REPO: SakuraIndex/Sakura-Index-Site
   SITE_BRANCH: main
-  PUBLISH_DIR: docs/charts/AIN10
+  PUBLISH_DIR: docs/charts/AIN10             # ←サイト側ディレクトリ
   PUBLISH_TOKEN: ${{ secrets.SITE_PUBLISH_TOKEN || secrets.SITE_PAT || secrets.GITHUB_TOKEN }}
 
 concurrency:
@@ -46,7 +45,7 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 12
+    timeout-minutes: 15
 
     steps:
       - name: Checkout (this repo)
@@ -54,7 +53,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Setup Python
+      - name: Setup Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -64,6 +63,7 @@ jobs:
         run: |
           set -e
           python -m pip install -U pip
+          # できるだけ軽く
           python -m pip install pandas matplotlib
 
       - name: Verify inputs & files
@@ -71,103 +71,226 @@ jobs:
         run: |
           set -e
           test -f "${CSV}" || (echo "❌ Missing CSV: ${CSV}" && exit 1)
-          test -f scripts/make_intraday_post.py || (echo "❌ Missing script: scripts/make_intraday_post.py" && exit 1)
 
+      - name: Decide US session (EDT/EST -> JST)
+        id: sess
+        shell: bash
+        run: |
+          set -e
+          # 入力に明示があればそれを優先
+          if [ -n "${{ inputs.session_start }}" ] && [ -n "${{ inputs.session_end }}" ]; then
+            echo "start=${{ inputs.session_start }}" >> "$GITHUB_OUTPUT"
+            echo "end=${{ inputs.session_end }}"     >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # 自動判定：NYのタイムゾーン略称でEDT/ESTを判別
+          NY_ABBR=$(TZ=America/New_York date +%Z)
+          if [ "$NY_ABBR" = "EDT" ]; then
+            # EDT（夏時間）→ JST 22:30–05:00
+            S=22:30; E=05:00
+          else
+            # EST（冬時間）→ JST 23:30–06:00
+            S=23:30; E=06:00
+          fi
+          echo "start=${S}" >> "$GITHUB_OUTPUT"
+          echo "end=${E}"   >> "$GITHUB_OUTPUT"
+
+      - name: Prepare output directories
+        shell: bash
+        run: |
+          set -e
+          mkdir -p "$(dirname "${OUT_JSON}")" "$(dirname "${OUT_TEXT}")" "$(dirname "${SNAPSHOT_PNG}")"
+
+      # ---- 一次生成：既存スクリプト（古い引数セット互換）を“ベストエフォート”で呼ぶ ----
       - name: Generate intraday snapshot (US session, JST)
         shell: bash
         env:
-          SESSION_START: ${{ inputs.session_start }}
-          SESSION_END:   ${{ inputs.session_end }}
-          DAY_ANCHOR:    ${{ inputs.day_anchor }}
-          VALUE_TYPE:    ${{ inputs.value_type }}
+          VALUE_TYPE: ${{ inputs.value_type || 'auto' }}
         run: |
-          set -e
-          echo "=== Generate ${INDEX_KEY} intraday snapshot ==="
-          python scripts/make_intraday_post.py \
-            --index-key "${INDEX_KEY}" \
-            --csv "${CSV}" \
-            --out-json "${OUT_JSON}" \
-            --out-text "${OUT_TEXT}" \
-            --snapshot-png "${SNAPSHOT_PNG}" \
-            --session-start "${SESSION_START}" \
-            --session-end   "${SESSION_END}" \
-            --day-anchor    "${DAY_ANCHOR}" \
-            --basis         "${BASIS}" \
-            --label         "${LABEL}" \
-            --dt-col        "${DT_COL}" \
-            --value-type    "${VALUE_TYPE}" || echo "[fallback] primary CLI failed"
+          set -euo pipefail
+          echo "=== Try legacy CLI (best-effort) ==="
+          # 既存の make_intraday_post.py が古い引数セットの場合に備え、最小引数のみ
+          if [ -f scripts/make_intraday_post.py ]; then
+            python scripts/make_intraday_post.py \
+              --index-key "${INDEX_KEY}" \
+              --csv "${CSV}" \
+              --out-json "${OUT_JSON}" \
+              --out-text "${OUT_TEXT}" || echo "[warn] legacy CLI failed (will fallback)"
+          else
+            echo "[warn] scripts/make_intraday_post.py not found (will fallback)"
+          fi
 
-      - name: Ensure fallback PNG if missing (safe heredoc)
+      # ---- フォールバック：PNG/JSON を安全に作成（ここドキュメント厳密終端）----
+      - name: Ensure fallback PNG/JSON if missing (safe heredoc)
+        shell: bash
+        env:
+          CSV: ${{ env.CSV }}
+          OUT_JSON: ${{ env.OUT_JSON }}
+          OUT_TEXT: ${{ env.OUT_TEXT }}
+          SNAPSHOT_PNG: ${{ env.SNAPSHOT_PNG }}
+          LABEL: ${{ env.LABEL }}
+          INDEX_KEY: ${{ env.INDEX_KEY }}
+          START_JST: ${{ steps.sess.outputs.start }}
+          END_JST:   ${{ steps.sess.outputs.end }}
+          VALUE_TYPE: ${{ inputs.value_type || 'auto' }}
+        run: |
+          set -euo pipefail
+          need_png=false
+          need_json=false
+          [ -f "${SNAPSHOT_PNG}" ] || need_png=true
+          [ -f "${OUT_JSON}" ]     || need_json=true
+
+          if $need_png || $need_json; then
+            echo "[fallback] generating ${SNAPSHOT_PNG} / ${OUT_JSON}"
+            cat > _fallback_intraday.py <<'PY'
+import os, json, math, numpy as np, pandas as pd
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from pathlib import Path
+JST = "Asia/Tokyo"
+
+CSV = Path(os.environ["CSV"])
+OUT_JSON = Path(os.environ["OUT_JSON"])
+OUT_TEXT = Path(os.environ["OUT_TEXT"])
+SNAPSHOT_PNG = Path(os.environ["SNAPSHOT_PNG"])
+LABEL = os.environ.get("LABEL","AIN-10")
+INDEX_KEY = os.environ.get("INDEX_KEY","AIN-10")
+START = os.environ.get("START_JST","22:30")
+END   = os.environ.get("END_JST","05:00")
+VALUE_TYPE = os.environ.get("VALUE_TYPE","auto").lower()
+
+def to_jst_index(df: pd.DataFrame) -> pd.DataFrame:
+    # Datetime 列を自動推定
+    for c in df.columns:
+        ts = pd.to_datetime(df[c], errors="coerce", utc=True)
+        if ts.notna().mean() > 0.8:
+            out = df.copy()
+            out.index = ts.dt.tz_convert(JST)
+            return out.drop(columns=[c]).sort_index()
+    # 先頭列を日時とみなす最後の手
+    ts = pd.to_datetime(df.iloc[:,0], errors="coerce", utc=True)
+    out = df.copy()
+    out.index = ts.dt.tz_convert(JST)
+    return out.drop(columns=[df.columns[0]]).sort_index()
+
+def session_slice(df: pd.DataFrame, start_hm: str, end_hm: str) -> pd.DataFrame:
+    if df.empty:
+        return df
+    day = df.index[-1].date()
+    s = pd.Timestamp(f"{day} {start_hm}", tz=JST)
+    e = pd.Timestamp(f"{day} {end_hm}", tz=JST)
+    # 翌日に跨る場合へ対応（例 22:30→05:00）
+    if e < s:
+        mask = (df.index >= s) | (df.index <= e + pd.Timedelta(days=1))
+        return df.loc[mask]
+    return df.loc[(df.index >= s) & (df.index <= e)]
+
+def detect_ratio(values: np.ndarray) -> bool:
+    values = values[~np.isnan(values)]
+    if values.size == 0:
+        return False
+    return float(np.quantile(np.abs(values), 0.95)) < 0.5
+
+def to_percent(series: pd.Series, value_type: str) -> pd.Series:
+    s = pd.to_numeric(series, errors="coerce")
+    vt = value_type
+    if vt == "auto":
+        vt = "ratio" if detect_ratio(s.to_numpy()) else "percent"
+    if vt == "ratio":
+        s = s * 100.0
+    return s
+
+df_raw = pd.read_csv(CSV)
+df = to_jst_index(df_raw)
+
+# 数値列の平均。INDEX_KEY 列があれば優先
+num_cols = [c for c in df.columns if pd.to_numeric(df[c], errors="coerce").notna().mean() > 0.8]
+key_like = [c for c in num_cols if c.strip().upper() in (INDEX_KEY, INDEX_KEY.replace("-",""))]
+if key_like:
+    s_raw = pd.to_numeric(df[key_like[0]], errors="coerce")
+else:
+    s_raw = df[num_cols].mean(axis=1)
+
+df_sess = session_slice(df.assign(v=s_raw)["v"].to_frame(), START, END)
+s_pct = to_percent(df_sess["v"], VALUE_TYPE)
+last_pct = float(np.round(s_pct.dropna().iloc[-1], 4)) if not s_pct.dropna().empty else 0.0
+
+# 線色：+青 / −赤
+line_color = "#00E5FF" if last_pct >= 0 else "#FF4D4D"
+plt.figure(figsize=(12,6), dpi=160)
+ax = plt.gca()
+ax.set_facecolor("#000000")
+plt.plot(s_pct.index, s_pct.values, linewidth=2.0, color=line_color)
+plt.title(f"{LABEL} Intraday Snapshot ({pd.Timestamp.now(tz=JST):%Y/%m/%d %H:%M})  {last_pct:+.2f}%")
+plt.xlabel("Time"); plt.ylabel("Change vs Prev Close (%)")
+for sp in ax.spines.values():
+    sp.set_color("#444444")
+plt.tight_layout()
+SNAPSHOT_PNG.parent.mkdir(parents=True, exist_ok=True)
+plt.savefig(SNAPSHOT_PNG, facecolor="#000000", edgecolor="none")
+plt.close()
+
+# テキスト（X投稿下書き）
+OUT_TEXT.parent.mkdir(parents=True, exist_ok=True)
+arrow = "▲" if last_pct >= 0 else "▼"
+OUT_TEXT.write_text(
+    f"{arrow} {LABEL} 日中スナップショット ({pd.Timestamp.now(tz=JST):%Y/%m/%d %H:%M})\n"
+    f"{last_pct:+.2f}% (基準: prev_close)\n"
+    f"#{INDEX_KEY} #日本株\n",
+    encoding="utf-8"
+)
+
+# JSON（ratio 小数で保存）
+payload = {
+    "index_key": INDEX_KEY,
+    "label": LABEL,
+    "pct_intraday": float(np.round(last_pct/100.0, 6)),
+    "basis": "prev_close",
+    "session": {"start": START, "end": END, "anchor": START},
+    "updated_at": pd.Timestamp.now(tz=JST).isoformat(),
+}
+OUT_JSON.parent.mkdir(parents=True, exist_ok=True)
+OUT_JSON.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+PY
+            python _fallback_intraday.py
+          else
+            echo "[ok] primary CLI already produced PNG/JSON"
+          fi
+
+      - name: Normalize JSON to ratio (safety)
+        if: always()
         shell: bash
         run: |
           set -e
-          if [ ! -s "${SNAPSHOT_PNG}" ]; then
-            echo "[fallback] generating simple PNG → ${SNAPSHOT_PNG}"
-            cat > _fallback_png.py <<'PY'
-            import os
-            from pathlib import Path
-            import pandas as pd
-            import matplotlib
-            matplotlib.use("Agg")
-            import matplotlib.pyplot as plt
+          python - <<'PY'
+import json, pathlib, datetime as dt
+p = pathlib.Path("${OUT_JSON}")
+if p.exists():
+    d = json.loads(p.read_text(encoding="utf-8"))
+    v = d.get("pct_intraday")
+    # percent → ratio 補正
+    try:
+        if v is not None and abs(v) > 1.0:
+            d["pct_intraday"] = round(float(v)/100.0, 6)
+    except Exception:
+        pass
+    d["updated_at"] = dt.datetime.now(dt.timezone(dt.timedelta(hours=9))).isoformat()
+    p.write_text(json.dumps(d, ensure_ascii=False, indent=2), encoding="utf-8")
+PY
 
-            csv = Path(os.environ["CSV"])
-            png = Path(os.environ["SNAPSHOT_PNG"])
-
-            df = pd.read_csv(csv)
-            cols = [c for c in df.columns if c.lower() != "datetime"]
-            y = df[cols].mean(axis=1) if cols else pd.Series([0])
-            plt.figure(figsize=(12,4), dpi=160)
-            plt.plot(y)
-            plt.title("AIN-10 Intraday (fallback)")
-            plt.tight_layout()
-            png.parent.mkdir(parents=True, exist_ok=True)
-            plt.savefig(png)
-            PY
-            python _fallback_png.py
-          fi
-
-      - name: Normalize JSON (pct_intraday → ratio) (safe heredoc)
-        shell: bash
-        run: |
-          set -e
-          if [ -s "${OUT_JSON}" ]; then
-            cat > _normalize_json.py <<'PY'
-            import json, os, datetime as dt
-            from pathlib import Path
-
-            p = Path(os.environ["OUT_JSON"])
-            d = json.loads(p.read_text(encoding="utf-8")) if p.exists() else {}
-            v = d.get("pct_intraday")
-
-            fv = None
-            try:
-                fv = float(v)
-            except Exception:
-                fv = None
-
-            if fv is not None and abs(fv) > 1.0:
-                d["pct_intraday"] = round(fv/100.0, 6)
-            elif fv is not None:
-                d["pct_intraday"] = fv
-
-            d["updated_at"] = dt.datetime.now().astimezone().isoformat()
-            p.write_text(json.dumps(d, ensure_ascii=False, indent=2), encoding="utf-8")
-            PY
-            python _normalize_json.py
-          fi
-
-      - name: Upload artifacts (debug)
+      - name: Upload artifacts (for debug)
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: ain10_intraday_artifacts
           path: |
-            ${{ env.OUT_JSON }}
             ${{ env.OUT_TEXT }}
             ${{ env.SNAPSHOT_PNG }}
+            ${{ env.OUT_JSON }}
 
-      - name: Checkout site repo
+      # === 公開サイトへ反映 ===
+      - name: Checkout site repo (for publishing)
         uses: actions/checkout@v4
         with:
           repository: ${{ env.SITE_REPO }}
@@ -179,29 +302,29 @@ jobs:
       - name: Copy files to site (expected names)
         shell: bash
         run: |
-          set -e
+          set -euo pipefail
           dst="site/${PUBLISH_DIR}"
           mkdir -p "${dst}"
           cp -f "${OUT_JSON}"     "${dst}/stats.json"
           cp -f "${OUT_TEXT}"     "${dst}/post_intraday.txt"
           cp -f "${SNAPSHOT_PNG}" "${dst}/intraday.png"
+          echo "📁 Copied to ${dst}:"
           ls -l "${dst}"
 
       - name: Commit & push site
         working-directory: site
         shell: bash
         run: |
-          set -e
+          set -euo pipefail
           git config user.email "actions@github.com"
           git config user.name  "github-actions[bot]"
           git add -A
           if git diff --cached --quiet; then
             echo "No changes to commit."
           else
-            git commit -m "Update AIN-10 intraday (US session) $(date '+%Y-%m-%d %H:%M JST')"
+            git commit -m "Update AIN-10 intraday charts ($(date '+%Y-%m-%d %H:%M JST'))"
             git push origin "${SITE_BRANCH}"
           fi
 
       - name: Done
-        shell: bash
-        run: echo "✅ AIN-10 intraday workflow finished."
+        run: echo "✅ Workflow finished."
