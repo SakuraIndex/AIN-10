@@ -24,19 +24,22 @@ permissions:
   contents: write
 
 env:
-  INDEX_KEY: AIN10
+  # ===== リポ側 =====
+  INDEX_KEY: AIN-10
   LABEL: AIN-10
   CSV: docs/outputs/ain10_intraday.csv
   DT_COL: Datetime
   BASIS: prev_close
 
+  # 生成物（リポ内の一時パス：名前は任意）
   OUT_JSON: docs/charts/ain10_stats.json
   OUT_TEXT: docs/charts/ain10_post_intraday.txt
   SNAPSHOT_PNG: docs/charts/ain10_1d.png
 
+  # ===== サイト側 =====
   SITE_REPO: SakuraIndex/Sakura-Index-Site
   SITE_BRANCH: main
-  PUBLISH_DIR: docs/charts/AIN10
+  PUBLISH_DIR: docs/charts/AIN10   # ←サイトは AIN10（ハイフン無し）
   PUBLISH_TOKEN: ${{ secrets.SITE_PUBLISH_TOKEN || secrets.SITE_PAT || secrets.GITHUB_TOKEN }}
 
 concurrency:
@@ -47,6 +50,7 @@ jobs:
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 12
+
     steps:
       - name: Checkout (this repo)
         uses: actions/checkout@v4
@@ -62,10 +66,11 @@ jobs:
         shell: bash
         run: |
           set -e
-          python -m pip install -U pip
           if [ -f requirements.txt ]; then
+            python -m pip install -U pip
             python -m pip install -r requirements.txt
           else
+            python -m pip install -U pip
             python -m pip install pandas matplotlib
           fi
 
@@ -82,13 +87,14 @@ jobs:
           set -e
           mkdir -p "$(dirname "${OUT_JSON}")" "$(dirname "${OUT_TEXT}")" "$(dirname "${SNAPSHOT_PNG}")"
 
+      # ===== 生成 =====
       - name: Generate intraday snapshot and post
-        shell: bash
         env:
           SESSION_START: ${{ inputs.session_start }}
           SESSION_END:   ${{ inputs.session_end }}
           DAY_ANCHOR:    ${{ inputs.day_anchor }}
           VALUE_TYPE:    ${{ inputs.value_type }}
+        shell: bash
         run: |
           set -euo pipefail
           echo "=== Generate ${INDEX_KEY} intraday snapshot ==="
@@ -106,6 +112,7 @@ jobs:
             --dt-col        "${DT_COL}" \
             --value-type    "${VALUE_TYPE}"
 
+      # ===== PNG が無ければ簡易PNG（安全な独立ステップ） =====
       - name: Fallback: create simple PNG if missing
         if: ${{ always() }}
         shell: bash
@@ -117,11 +124,11 @@ jobs:
 import pandas as pd
 import matplotlib.pyplot as plt
 from pathlib import Path
-csv = Path("${CSV}")
-png = Path("${SNAPSHOT_PNG}")
+csv = Path("${CSV}"); png = Path("${SNAPSHOT_PNG}")
 df = pd.read_csv(csv)
+# 最もそれっぽい数値列の平均を簡易描画
 cols = [c for c in df.columns if c.lower() != "datetime"]
-y = df[cols].mean(axis=1) if cols else pd.Series([0.0])
+y = df[cols].mean(axis=1) if cols else pd.Series([0])
 plt.figure(figsize=(12,4), dpi=160)
 plt.plot(range(len(y)), y)
 plt.title("AIN-10 Intraday (fallback)")
@@ -131,6 +138,7 @@ plt.savefig(png)
 PY
           fi
 
+      # ===== JSON 正規化：pct_intraday は ratio(小数)へ（安全な独立ステップ） =====
       - name: Normalize JSON to ratio (safety)
         if: ${{ always() }}
         shell: bash
@@ -140,13 +148,13 @@ PY
 import json, pathlib, datetime
 p = pathlib.Path("${OUT_JSON}")
 if p.exists():
-    d = json.loads(p.read_text(encoding="utf-8"))
-    x = d.get("pct_intraday", None)
-    if isinstance(x, (int, float)) and abs(x) > 1.0:
-        d["pct_intraday"] = round(float(x)/100.0, 6)
-    d.setdefault("updated_at",
-                 datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=9))).isoformat())
-    p.write_text(json.dumps(d, ensure_ascii=False, indent=2), encoding="utf-8")
+    data = json.loads(p.read_text(encoding="utf-8"))
+    v = data.get("pct_intraday")
+    if isinstance(v, (int, float)) and abs(v) > 1.0:
+        # percent → ratio へ補正（例: 1.23 → 0.0123）
+        data["pct_intraday"] = round(float(v)/100.0, 6)
+        data["updated_at"] = datetime.datetime.now().astimezone().isoformat()
+        p.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 PY
 
       - name: Upload artifacts (for debug)
@@ -159,6 +167,7 @@ PY
             ${{ env.SNAPSHOT_PNG }}
             ${{ env.OUT_JSON }}
 
+      # ===== サイトへ反映 =====
       - name: Checkout site repo (for publishing)
         uses: actions/checkout@v4
         with:
@@ -168,15 +177,17 @@ PY
           path: site
           fetch-depth: 0
 
-      - name: Copy snapshot files into site tree
+      - name: Copy snapshot files into site tree (use site-expected names)
         shell: bash
         run: |
           set -euo pipefail
           dst="site/${PUBLISH_DIR}"
           mkdir -p "${dst}"
+          # サイトは固定名：stats.json / intraday.png / post_intraday.txt
           cp -f "${OUT_JSON}"     "${dst}/stats.json"
           cp -f "${OUT_TEXT}"     "${dst}/post_intraday.txt"
           cp -f "${SNAPSHOT_PNG}" "${dst}/intraday.png"
+          echo "📁 Copied to ${dst}:"
           ls -l "${dst}"
 
       - name: Commit & push site charts
@@ -193,3 +204,11 @@ PY
             git commit -m "Update AIN-10 intraday charts ($(date '+%Y-%m-%d %H:%M JST'))"
             git push origin "${SITE_BRANCH}"
           fi
+
+      - name: Post Setup Python 3.11
+        if: always()
+        run: python --version
+
+      - name: Post Checkout (this repo)
+        if: always()
+        run: echo "✅ Workflow finished."
