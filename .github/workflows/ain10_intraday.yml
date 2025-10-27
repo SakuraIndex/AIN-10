@@ -4,15 +4,15 @@ on:
   workflow_dispatch:
     inputs:
       session_start:
-        description: "Session start (JST)"
+        description: "Session start (HH:MM JST)"
         required: true
         default: "22:30"
       session_end:
-        description: "Session end (JST)"
+        description: "Session end (HH:MM JST)"
         required: true
         default: "05:00"
       day_anchor:
-        description: "Day anchor (JST)"
+        description: "Day anchor time (HH:MM JST)"
         required: true
         default: "22:30"
       value_type:
@@ -27,13 +27,25 @@ env:
   INDEX_KEY: AIN-10
   LABEL: AIN-10
   CSV: docs/outputs/ain10_intraday.csv
+  DT_COL: Datetime
+  BASIS: prev_close
+
+  # 生成物（このリポ内の一時出力）
   OUT_JSON: docs/charts/ain10_stats.json
   OUT_TEXT: docs/charts/ain10_post_intraday.txt
   SNAPSHOT_PNG: docs/charts/ain10_1d.png
+
+  # 公開サイトリポ
   SITE_REPO: SakuraIndex/Sakura-Index-Site
   SITE_BRANCH: main
+  # 公開先ディレクトリ（サイト内）
   PUBLISH_DIR: docs/charts/AIN10
+  # PAT があれば優先、無ければ GITHUB_TOKEN
   PUBLISH_TOKEN: ${{ secrets.SITE_PUBLISH_TOKEN || secrets.SITE_PAT || secrets.GITHUB_TOKEN }}
+
+concurrency:
+  group: "intraday-ain10-${{ github.ref }}"
+  cancel-in-progress: false
 
 jobs:
   build:
@@ -41,151 +53,216 @@ jobs:
     timeout-minutes: 12
 
     steps:
-      - name: Checkout repo
+      - name: Checkout (this repo)
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Setup Python
+      - name: Setup Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
       - name: Install deps
         run: |
-          python -m pip install -U pip pandas matplotlib pytz numpy
+          python -m pip install -U pip
+          python -m pip install pandas matplotlib numpy pytz
+
+      - name: Verify inputs & files
+        run: |
+          test -f "${CSV}" || (echo "❌ Missing CSV: ${CSV}" && exit 1)
+
+      - name: Prepare output dirs
+        run: |
+          mkdir -p "$(dirname "${OUT_JSON}")" "$(dirname "${OUT_TEXT}")" "$(dirname "${SNAPSHOT_PNG}")"
 
       - name: Generate intraday snapshot (US session, JST)
         env:
           SESSION_START: ${{ inputs.session_start }}
-          SESSION_END: ${{ inputs.session_end }}
-          DAY_ANCHOR: ${{ inputs.day_anchor }}
-          VALUE_TYPE: ${{ inputs.value_type }}
+          SESSION_END:   ${{ inputs.session_end }}
+          DAY_ANCHOR:    ${{ inputs.day_anchor }}
+          VALUE_TYPE:    ${{ inputs.value_type }}
         run: |
-          set -euo pipefail
           python - <<'PY'
-          import os, pandas as pd, numpy as np, matplotlib
+          import os, json
           from pathlib import Path
+          import pandas as pd, numpy as np
           from datetime import timedelta
+          import matplotlib
           matplotlib.use("Agg")
           import matplotlib.pyplot as plt
-          import json
 
+          # ---------- env ----------
           CSV = Path(os.environ["CSV"])
           OUT_JSON = Path(os.environ["OUT_JSON"])
           OUT_TEXT = Path(os.environ["OUT_TEXT"])
           SNAPSHOT_PNG = Path(os.environ["SNAPSHOT_PNG"])
-          LABEL = os.environ.get("LABEL", "AIN-10")
-          INDEX_KEY = os.environ.get("INDEX_KEY", "AIN-10")
+          LABEL = os.environ.get("LABEL","AIN-10")
+          INDEX_KEY = os.environ.get("INDEX_KEY","AIN-10")
+          DT_COL = os.environ.get("DT_COL","")
+          BASIS = os.environ.get("BASIS","prev_close")
+          VTYPE = os.environ.get("VALUE_TYPE","auto").lower()
+          S_START = os.environ.get("SESSION_START","22:30")
+          S_END   = os.environ.get("SESSION_END","05:00")
+          D_ANCHOR= os.environ.get("DAY_ANCHOR","22:30")
+          JST = "Asia/Tokyo"
 
-          S_START = os.environ.get("SESSION_START", "22:30")
-          S_END = os.environ.get("SESSION_END", "05:00")
-          D_ANCHOR = os.environ.get("DAY_ANCHOR", "22:30")
+          # ---------- helpers ----------
+          def _auto_dt_col(df):
+            # 優先候補
+            cand = ["Datetime","datetime","Timestamp","timestamp","Date","date","Time","time"]
+            for c in cand:
+              if c in df.columns:
+                try:
+                  x = pd.to_datetime(df[c], errors="coerce")
+                  if x.notna().mean() >= 0.7: return c
+                except: pass
+            # 数で最良候補
+            best, bestv = None, -1.0
+            for c in df.columns:
+              try:
+                v = pd.to_datetime(df[c], errors="coerce").notna().mean()
+                if v > bestv: best, bestv = c, v
+              except: pass
+            return best
 
-          OUT_JSON.parent.mkdir(parents=True, exist_ok=True)
-          SNAPSHOT_PNG.parent.mkdir(parents=True, exist_ok=True)
-          OUT_TEXT.parent.mkdir(parents=True, exist_ok=True)
+          def _to_percent_series(s, value_type):
+            s = pd.to_numeric(s, errors="coerce")
+            vt = value_type
+            if vt == "auto":
+              # 95%点の絶対値が0.5未満なら ratio とみなす
+              arr = s.to_numpy()
+              arr = arr[~np.isnan(arr)]
+              if arr.size == 0: return s # そのまま
+              vt = "ratio" if float(np.quantile(np.abs(arr), 0.95)) < 0.5 else "percent"
+            if vt == "ratio":  # 0.01 → 1%
+              s = s * 100.0
+            return s
 
+          # ---------- load ----------
           df = pd.read_csv(CSV)
-          if df.empty:
-              raise RuntimeError("CSVにデータがありません。")
+          if df.empty: raise RuntimeError("CSV が空です。")
+          dt_col = DT_COL if DT_COL in df.columns else _auto_dt_col(df)
+          if not dt_col: raise RuntimeError("日時列を検出できませんでした。")
 
-          # Datetime列自動検出
-          dt_col = next((c for c in df.columns if "time" in c.lower() or "date" in c.lower()), None)
-          if not dt_col:
-              dt_col = df.columns[0]
-          df[dt_col] = pd.to_datetime(df[dt_col], errors="coerce")
-          df = df.dropna(subset=[dt_col])
+          dt = pd.to_datetime(df[dt_col], errors="coerce")
+          if dt.dt.tz is None: dt = dt.dt.tz_localize("UTC", nonexistent="NaT", ambiguous="NaT")
+          # UTC → JST
+          dt = dt.dt.tz_convert(JST)
+          df = df.set_index(dt).drop(columns=[dt_col]).sort_index()
 
-          # UTC→JST 自動補正
-          tz_diff = (pd.Timestamp.now() - df[dt_col].iloc[-1]).total_seconds() / 3600.0
-          if abs(tz_diff) > 6:
-              df[dt_col] = df[dt_col] + timedelta(hours=9)
+          # 数値列を選ぶ
+          numcols = [c for c in df.columns if pd.to_numeric(df[c], errors="coerce").notna().mean() > 0.6]
+          if not numcols: numcols = [df.columns[-1]]
+          valcol = numcols[0]
+          df[valcol] = _to_percent_series(df[valcol], VTYPE)
 
-          df = df.sort_values(dt_col)
-          df = df.set_index(dt_col)
+          # ---------- session filter (JST) ----------
+          last = df.index[-1]
+          s_h, s_m = map(int, S_START.split(":"))
+          e_h, e_m = map(int, S_END.split(":"))
+          sdt = last.replace(hour=s_h, minute=s_m, second=0, microsecond=0)
+          edt = last.replace(hour=e_h, minute=e_m, second=0, microsecond=0)
+          if edt <= sdt: edt += timedelta(days=1)
+          sess = df.loc[(df.index >= sdt) & (df.index <= edt)]
+          if sess.empty:
+            # セッション内が空なら直近1日分
+            sess = df.last("1D")
+          y = pd.to_numeric(sess[valcol], errors="coerce").dropna()
+          if y.empty: y = pd.Series([0.0], index=[last])
 
-          # 数値列検出
-          numcols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
-          if not numcols:
-              numcols = [df.columns[-1]]
-          col = numcols[0]
+          last_pct = float(y.iloc[-1])
+          last_ratio = round(last_pct/100.0, 6)  # JSONは ratio（小数）
 
-          # セッション範囲
-          last_dt = df.index[-1]
-          start_h, start_m = map(int, S_START.split(":"))
-          end_h, end_m = map(int, S_END.split(":"))
-          start = last_dt.replace(hour=start_h, minute=start_m)
-          end = last_dt.replace(hour=end_h, minute=end_m)
-          if end <= start:
-              end += timedelta(days=1)
+          # ---------- plot (dark theme) ----------
+          now_jst = pd.Timestamp.now(tz=JST)
+          fig, ax = plt.subplots(figsize=(12,6), dpi=160)
+          fig.patch.set_facecolor("#000000")
+          ax.set_facecolor("#000000")
+          for sp in ax.spines.values(): sp.set_color("#444444")
+          ax.grid(True, color="#333333", linewidth=0.6, alpha=0.7)
 
-          session_df = df.loc[(df.index >= start - timedelta(hours=1)) & (df.index <= end)]
-          if session_df.empty:
-              print("⚠️ セッション内データが無いため、直近1日を使用します。")
-              session_df = df.last("1D")
+          line_color = "#00E5FF" if last_pct >= 0 else "#FF4D4D"
+          ax.plot(y.index, y.values, color=line_color, linewidth=2.0)
 
-          y = pd.to_numeric(session_df[col], errors="coerce").dropna()
-          if y.empty:
-              y = pd.Series([0])
+          title = f"{LABEL} Intraday Snapshot ({now_jst:%Y/%m/%d %H:%M JST})  {last_pct:+.2f}%"
+          ax.set_title(title, color="#DDDDDD", pad=14)
+          ax.set_xlabel("Time (JST)", color="#BBBBBB")
+          ax.set_ylabel("Change vs Prev Close (%)", color="#BBBBBB")
+          ax.tick_params(colors="#BBBBBB")
 
-          last = float(y.iloc[-1])
-          last_ratio = last / 100 if abs(last) > 1 else last
+          fig.tight_layout()
+          fig.savefig(SNAPSHOT_PNG, facecolor=fig.get_facecolor(), edgecolor="none")
+          plt.close(fig)
 
-          plt.figure(figsize=(12,6), dpi=160)
-          plt.plot(session_df.index, y, color="#00E5FF" if last >= 0 else "#FF4D4D", linewidth=2)
-          plt.title(f"{LABEL} Intraday Snapshot ({last:+.2f}%)")
-          plt.grid(True, alpha=0.3)
-          plt.tight_layout()
-          plt.savefig(SNAPSHOT_PNG)
-
-          OUT_JSON.write_text(json.dumps({
-              "index_key": INDEX_KEY,
-              "label": LABEL,
-              "pct_intraday": round(last_ratio, 6),
-              "basis": "prev_close",
-              "session": {"start": S_START, "end": S_END, "anchor": D_ANCHOR},
-              "updated_at": pd.Timestamp.now().isoformat()
-          }, ensure_ascii=False, indent=2), encoding="utf-8")
-
+          # ---------- outputs ----------
           OUT_TEXT.write_text(
-              f"{LABEL} Intraday Snapshot\n{last:+.2f}%\nSession: {S_START}-{S_END}\n",
-              encoding="utf-8"
+            f"{LABEL}  日中スナップショット ({now_jst:%Y/%m/%d %H:%M})\n"
+            f"{last_pct:+.2f}% (基準: {BASIS})\n"
+            f"#{INDEX_KEY.replace('-','')} #日本株\n",
+            encoding="utf-8"
           )
-          print(f"✅ Done. PNG/JSON/TXT generated: {SNAPSHOT_PNG}")
+
+          stats = {
+            "index_key": INDEX_KEY,
+            "label": LABEL,
+            "pct_intraday": last_ratio,       # ratio
+            "basis": BASIS,
+            "session": {"start": S_START, "end": S_END, "anchor": D_ANCHOR},
+            "updated_at": now_jst.isoformat()
+          }
+          OUT_JSON.write_text(json.dumps(stats, ensure_ascii=False, indent=2), encoding="utf-8")
+
+          print("✅ Generated:", SNAPSHOT_PNG, OUT_TEXT, OUT_JSON)
           PY
 
-      - name: Upload artifacts
+      - name: Upload artifacts (debug)
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: ain10_intraday_artifacts
           path: |
-            ${{ env.OUT_JSON }}
             ${{ env.OUT_TEXT }}
             ${{ env.SNAPSHOT_PNG }}
+            ${{ env.OUT_JSON }}
 
-      - name: Checkout site repo
+      - name: Checkout site repo (for publishing)
         uses: actions/checkout@v4
         with:
           repository: ${{ env.SITE_REPO }}
           ref: ${{ env.SITE_BRANCH }}
           token: ${{ env.PUBLISH_TOKEN }}
           path: site
+          fetch-depth: 0
 
-      - name: Copy & push to site
+      - name: Copy files to site (expected names)
         run: |
           set -e
           dst="site/${PUBLISH_DIR}"
-          mkdir -p "$dst"
-          cp -f "${OUT_JSON}" "$dst/stats.json"
-          cp -f "${OUT_TEXT}" "$dst/post_intraday.txt"
-          cp -f "${SNAPSHOT_PNG}" "$dst/intraday.png"
-          cd site
+          mkdir -p "${dst}"
+          cp -f "${OUT_JSON}"     "${dst}/stats.json"
+          cp -f "${OUT_TEXT}"     "${dst}/post_intraday.txt"
+          cp -f "${SNAPSHOT_PNG}" "${dst}/intraday.png"
+          echo "📁 Copied to ${dst}:"
+          ls -l "${dst}"
+
+      - name: Commit & push site
+        working-directory: site
+        run: |
           git config user.email "actions@github.com"
-          git config user.name "github-actions[bot]"
-          git add .
+          git config user.name  "github-actions[bot]"
+          git add -A
           if git diff --cached --quiet; then
-            echo "No site changes."
+            echo "No changes to commit."
           else
-            git commit -m "Update AIN-10 intraday charts"
-            git push
+            git commit -m "Update AIN-10 intraday charts (dark theme) ($(date '+%Y-%m-%d %H:%M JST'))"
+            git push origin "${{ env.SITE_BRANCH }}"
           fi
+
+      - name: Post Setup Python 3.11
+        if: always()
+        run: python --version
+
+      - name: Post Checkout (this repo)
+        if: always()
+        run: echo "✅ Workflow finished."
