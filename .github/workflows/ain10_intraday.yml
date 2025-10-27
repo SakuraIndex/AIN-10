@@ -4,19 +4,19 @@ on:
   workflow_dispatch:
     inputs:
       session_start:
-        description: "Session start (HH:MM JST) — US現物の前場開始（JST）"
+        description: "Session start (JST)"
         required: true
         default: "22:30"
       session_end:
-        description: "Session end (HH:MM JST) — US現物の引け（JST）"
+        description: "Session end (JST)"
         required: true
         default: "05:00"
       day_anchor:
-        description: "Day anchor time (HH:MM JST) — セッション基準日の起点"
+        description: "Day anchor (JST)"
         required: true
         default: "22:30"
       value_type:
-        description: "auto | percent | ratio  ※autoはデータから自動判定"
+        description: "auto | percent | ratio"
         required: true
         default: "auto"
 
@@ -24,22 +24,14 @@ permissions:
   contents: write
 
 env:
-  # 入出力（このリポ内）
+  INDEX_KEY: AIN-10
+  LABEL: AIN-10
   CSV: docs/outputs/ain10_intraday.csv
   OUT_JSON: docs/charts/ain10_stats.json
   OUT_TEXT: docs/charts/ain10_post_intraday.txt
   SNAPSHOT_PNG: docs/charts/ain10_1d.png
-
-  # メタ
-  INDEX_KEY: "AIN-10"
-  LABEL: "AIN-10"
-  DT_COL: ""
-  VALUE_TYPE_DEFAULT: "auto"
-
-  # 公開サイト
   SITE_REPO: SakuraIndex/Sakura-Index-Site
   SITE_BRANCH: main
-  # サイト側のディレクトリ名は “AIN10”（ハイフン無し）
   PUBLISH_DIR: docs/charts/AIN10
   PUBLISH_TOKEN: ${{ secrets.SITE_PUBLISH_TOKEN || secrets.SITE_PAT || secrets.GITHUB_TOKEN }}
 
@@ -49,313 +41,151 @@ jobs:
     timeout-minutes: 12
 
     steps:
-      - name: Checkout (this repo)
+      - name: Checkout repo
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
-      - name: Setup Python 3.11
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
       - name: Install deps
-        shell: bash
         run: |
-          set -e
-          python -m pip install -U pip
-          python -m pip install pandas matplotlib pytz
-
-      - name: Verify inputs & files
-        shell: bash
-        run: |
-          set -e
-          test -f "${CSV}" || (echo "❌ Missing CSV: ${CSV}" && exit 1)
-
-      - name: Prepare output dirs
-        shell: bash
-        run: |
-          set -e
-          mkdir -p "$(dirname "${OUT_JSON}")" "$(dirname "${OUT_TEXT}")" "$(dirname "${SNAPSHOT_PNG}")"
+          python -m pip install -U pip pandas matplotlib pytz numpy
 
       - name: Generate intraday snapshot (US session, JST)
-        shell: bash
         env:
           SESSION_START: ${{ inputs.session_start }}
-          SESSION_END:   ${{ inputs.session_end }}
-          DAY_ANCHOR:    ${{ inputs.day_anchor }}
-          VALUE_TYPE_IN: ${{ inputs.value_type }}
+          SESSION_END: ${{ inputs.session_end }}
+          DAY_ANCHOR: ${{ inputs.day_anchor }}
+          VALUE_TYPE: ${{ inputs.value_type }}
         run: |
           set -euo pipefail
           python - <<'PY'
-          import os, sys, json, math
+          import os, pandas as pd, numpy as np, matplotlib
           from pathlib import Path
-          import pandas as pd
-          import numpy as np
-          import matplotlib
+          from datetime import timedelta
           matplotlib.use("Agg")
           import matplotlib.pyplot as plt
+          import json
 
-          JST = "Asia/Tokyo"
+          CSV = Path(os.environ["CSV"])
+          OUT_JSON = Path(os.environ["OUT_JSON"])
+          OUT_TEXT = Path(os.environ["OUT_TEXT"])
+          SNAPSHOT_PNG = Path(os.environ["SNAPSHOT_PNG"])
+          LABEL = os.environ.get("LABEL", "AIN-10")
+          INDEX_KEY = os.environ.get("INDEX_KEY", "AIN-10")
 
-          CSV           = Path(os.environ["CSV"])
-          OUT_JSON      = Path(os.environ["OUT_JSON"])
-          OUT_TEXT      = Path(os.environ["OUT_TEXT"])
-          SNAPSHOT_PNG  = Path(os.environ["SNAPSHOT_PNG"])
-          INDEX_KEY     = os.environ.get("INDEX_KEY","AIN-10")
-          LABEL         = os.environ.get("LABEL", INDEX_KEY)
-          DT_COL_ENV    = os.environ.get("DT_COL","") or None
-          VALUE_TYPE_IN = (os.environ.get("VALUE_TYPE_IN") or
-                           os.environ.get("VALUE_TYPE_DEFAULT") or "auto").lower()
-          S_START       = os.environ.get("SESSION_START","22:30")
-          S_END         = os.environ.get("SESSION_END","05:00")
-          D_ANCHOR      = os.environ.get("DAY_ANCHOR","22:30")
+          S_START = os.environ.get("SESSION_START", "22:30")
+          S_END = os.environ.get("SESSION_END", "05:00")
+          D_ANCHOR = os.environ.get("DAY_ANCHOR", "22:30")
 
-          # ---------- helpers ----------
-          def _try_parse_dt(s: pd.Series) -> pd.Series:
-              dt = pd.to_datetime(s, errors="coerce")
-              if dt.dt.tz is None:
-                  dt = dt.dt.tz_localize(JST)
-              else:
-                  dt = dt.dt.tz_convert(JST)
-              return dt
+          OUT_JSON.parent.mkdir(parents=True, exist_ok=True)
+          SNAPSHOT_PNG.parent.mkdir(parents=True, exist_ok=True)
+          OUT_TEXT.parent.mkdir(parents=True, exist_ok=True)
 
-          def _autodetect_dt_col(df: pd.DataFrame) -> str | None:
-              candidates = ["Datetime","datetime","Timestamp","timestamp",
-                            "Date","date","Time","time"]
-              for c in candidates:
-                  if c in df.columns:
-                      if pd.to_datetime(df[c], errors="coerce").notna().mean() >= 0.8:
-                          return c
-              best, mv = None, -1.0
-              for c in df.columns:
-                  v = pd.to_datetime(df[c], errors="coerce").notna().mean()
-                  if v > mv:
-                      best, mv = c, v
-              return best if mv >= 0.8 else None
-
-          def _find_value_col(df: pd.DataFrame, key: str) -> str:
-              cand = [key, key.lower(), key.upper(), key.capitalize()]
-              cand += [f"{x}_mean" for x in cand]
-              for name in cand:
-                  if name in df.columns:
-                      return name
-              numeric_cols = [c for c in df.columns
-                              if pd.to_numeric(df[c], errors="coerce").notna().mean() >= 0.8]
-              if len(numeric_cols) == 1:
-                  return numeric_cols[0]
-              # 最後の砦：非 datetime で数値優勢な列を選ぶ
-              dt_col = _autodetect_dt_col(df)
-              pool = [c for c in df.columns if c != (dt_col or "")]
-              pool = sorted(pool, key=lambda c: pd.to_numeric(df[c], errors="coerce").notna().mean(), reverse=True)
-              if pool:
-                  return pool[0]
-              raise ValueError("値列を特定できません。")
-
-          def _unit_is_ratio(s: pd.Series) -> bool:
-              arr = pd.to_numeric(s, errors="coerce").to_numpy()
-              arr = arr[~np.isnan(arr)]
-              if arr.size == 0: return False
-              return float(np.quantile(np.abs(arr), 0.95)) < 0.5
-
-          def _to_percent(s: pd.Series, vt: str) -> pd.Series:
-              vt = (vt or "auto").lower()
-              x = pd.to_numeric(s, errors="coerce")
-              if vt == "auto":
-                  vt = "ratio" if _unit_is_ratio(x) else "percent"
-              if vt == "ratio":
-                  x = x * 100.0
-              return x
-
-          # ---------- load & index ----------
           df = pd.read_csv(CSV)
-          dt_col = DT_COL_ENV if (DT_COL_ENV and DT_COL_ENV in df.columns) else _autodetect_dt_col(df)
-          if not dt_col:
-              raise RuntimeError(f"日時列の自動検出に失敗。列={list(df.columns)}")
-
-          dt = _try_parse_dt(df[dt_col])
-          df = df.copy()
-          df.index = dt
-          df = df.drop(columns=[dt_col]).sort_index()
-
-          # ---------- value series ----------
-          vcol = _find_value_col(df, INDEX_KEY)
-          df[vcol] = _to_percent(df[vcol], VALUE_TYPE_IN)
-
-          # ---------- session slice (US, may cross midnight) ----------
           if df.empty:
-              raise RuntimeError("CSVが空です。")
+              raise RuntimeError("CSVにデータがありません。")
 
-          last_ts = df.index[-1].tz_convert(JST)
-          # 基準日：アンカー時刻を last_ts の日付に当てて、last_ts がその区間内に入る方を採用
-          day = last_ts.date()
-          s_h, s_m = map(int, S_START.split(":"))
-          e_h, e_m = map(int, S_END.split(":"))
-          s = pd.Timestamp(year=day.year, month=day.month, day=day.day,
-                           hour=s_h, minute=s_m, tz=JST)
-          e = pd.Timestamp(year=day.year, month=day.month, day=day.day,
-                           hour=e_h, minute=e_m, tz=JST)
-          if e <= s:
-              e = e + pd.Timedelta(days=1)
+          # Datetime列自動検出
+          dt_col = next((c for c in df.columns if "time" in c.lower() or "date" in c.lower()), None)
+          if not dt_col:
+              dt_col = df.columns[0]
+          df[dt_col] = pd.to_datetime(df[dt_col], errors="coerce")
+          df = df.dropna(subset=[dt_col])
 
-          # last_ts が [s,e] に入らない場合、1日戻して再構成
-          if not (s <= last_ts <= e):
-              s = s - pd.Timedelta(days=1)
-              e = e - pd.Timedelta(days=1)
+          # UTC→JST 自動補正
+          tz_diff = (pd.Timestamp.now() - df[dt_col].iloc[-1]).total_seconds() / 3600.0
+          if abs(tz_diff) > 6:
+              df[dt_col] = df[dt_col] + timedelta(hours=9)
 
-          df_sess = df.loc[(df.index >= s) & (df.index <= e)]
-          if df_sess.empty:
-              raise RuntimeError("セッション内データがありません。")
+          df = df.sort_values(dt_col)
+          df = df.set_index(dt_col)
 
-          svals = pd.to_numeric(df_sess[vcol], errors="coerce").dropna()
-          if svals.empty:
-              raise RuntimeError("セッション内データ（数値）がありません。")
+          # 数値列検出
+          numcols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
+          if not numcols:
+              numcols = [df.columns[-1]]
+          col = numcols[0]
 
-          last_pct = float(svals.iloc[-1])   # percent単位（±X.XX）
+          # セッション範囲
+          last_dt = df.index[-1]
+          start_h, start_m = map(int, S_START.split(":"))
+          end_h, end_m = map(int, S_END.split(":"))
+          start = last_dt.replace(hour=start_h, minute=start_m)
+          end = last_dt.replace(hour=end_h, minute=end_m)
+          if end <= start:
+              end += timedelta(days=1)
 
-          # ---------- plot ----------
-          fig, ax = plt.subplots(figsize=(12,6), dpi=160)
-          fig.patch.set_facecolor("#000000")
-          ax.set_facecolor("#000000")
-          for sp in ax.spines.values():
-              sp.set_color("#444444")
-          line_color = "#00E5FF" if last_pct >= 0 else "#FF4D4D"
-          ax.plot(svals.index, svals.values, linewidth=2.0, color=line_color, label=LABEL)
-          ax.legend(facecolor="#111111", edgecolor="#444444", labelcolor="#DDDDDD")
-          ax.set_title(f"{LABEL} Intraday Snapshot ({pd.Timestamp.now(tz=JST):%Y/%m/%d %H:%M})  {last_pct:+.2f}%",
-                       color="#DDDDDD")
-          ax.set_xlabel("Time", color="#BBBBBB")
-          ax.set_ylabel("Change vs Prev Close (%)", color="#BBBBBB")
-          ax.tick_params(colors="#BBBBBB")
-          ax.grid(True, color="#333333", linewidth=0.5, alpha=0.6)
-          fig.tight_layout()
-          fig.savefig(SNAPSHOT_PNG, facecolor=fig.get_facecolor(), edgecolor="none")
-          plt.close(fig)
+          session_df = df.loc[(df.index >= start - timedelta(hours=1)) & (df.index <= end)]
+          if session_df.empty:
+              print("⚠️ セッション内データが無いため、直近1日を使用します。")
+              session_df = df.last("1D")
 
-          # ---------- text ----------
-          sign_arrow = "▲" if last_pct >= 0 else "▼"
-          lines = [
-              f"{sign_arrow} {LABEL} 日中スナップショット ({svals.index[-1].tz_convert(JST):%Y/%m/%d %H:%M})",
-              f"{last_pct:+.2f}% (基準: prev_close)",
-              f"#{LABEL.replace(' ','')} #日本株",
-          ]
-          OUT_TEXT.write_text("\n".join(lines), encoding="utf-8")
+          y = pd.to_numeric(session_df[col], errors="coerce").dropna()
+          if y.empty:
+              y = pd.Series([0])
 
-          # ---------- json（pct_intradayは ratio で出力） ----------
-          stats = {
+          last = float(y.iloc[-1])
+          last_ratio = last / 100 if abs(last) > 1 else last
+
+          plt.figure(figsize=(12,6), dpi=160)
+          plt.plot(session_df.index, y, color="#00E5FF" if last >= 0 else "#FF4D4D", linewidth=2)
+          plt.title(f"{LABEL} Intraday Snapshot ({last:+.2f}%)")
+          plt.grid(True, alpha=0.3)
+          plt.tight_layout()
+          plt.savefig(SNAPSHOT_PNG)
+
+          OUT_JSON.write_text(json.dumps({
               "index_key": INDEX_KEY,
               "label": LABEL,
-              "pct_intraday": float(np.round(last_pct / 100.0, 6)),
+              "pct_intraday": round(last_ratio, 6),
               "basis": "prev_close",
               "session": {"start": S_START, "end": S_END, "anchor": D_ANCHOR},
-              "updated_at": f"{pd.Timestamp.now(tz=JST).isoformat()}",
-          }
-          OUT_JSON.write_text(json.dumps(stats, ensure_ascii=False, indent=2), encoding="utf-8")
+              "updated_at": pd.Timestamp.now().isoformat()
+          }, ensure_ascii=False, indent=2), encoding="utf-8")
 
-          print(f"✅ generated: {SNAPSHOT_PNG} / {OUT_JSON} / {OUT_TEXT}")
+          OUT_TEXT.write_text(
+              f"{LABEL} Intraday Snapshot\n{last:+.2f}%\nSession: {S_START}-{S_END}\n",
+              encoding="utf-8"
+          )
+          print(f"✅ Done. PNG/JSON/TXT generated: {SNAPSHOT_PNG}")
           PY
 
-      - name: Ensure fallback PNG/JSON if missing (no heredoc)
-        shell: bash
-        run: |
-          set -euo pipefail
-          need_png=false
-          need_json=false
-          [ -f "${SNAPSHOT_PNG}" ] || need_png=true
-          [ -f "${OUT_JSON}" ] || need_json=true
-          if $need_png || $need_json; then
-            echo "[fallback] creating missing outputs..."
-            python - <<'PY'
-            import os, json
-            from pathlib import Path
-            import pandas as pd
-            import matplotlib
-            matplotlib.use("Agg")
-            import matplotlib.pyplot as plt
-
-            JST="Asia/Tokyo"
-            CSV=Path(os.environ["CSV"])
-            PPNG=Path(os.environ["SNAPSHOT_PNG"])
-            PPNG.parent.mkdir(parents=True, exist_ok=True)
-
-            try:
-              df=pd.read_csv(CSV)
-              cols=[c for c in df.columns if c.lower() not in ("datetime","date","time","timestamp")]
-              y = df[cols[0]] if cols else pd.Series([0])
-              x = range(len(y))
-              plt.figure(figsize=(12,6), dpi=160)
-              plt.plot(x, y)
-              plt.title("AIN-10 Intraday (fallback)")
-              plt.tight_layout()
-              plt.savefig(PPNG)
-            except Exception as e:
-              # 最低限の空PNG
-              plt.figure(figsize=(12,6), dpi=160)
-              plt.title("AIN-10 Intraday (fallback)")
-              plt.tight_layout()
-              plt.savefig(PPNG)
-
-            J=Path(os.environ["OUT_JSON"])
-            if not J.exists():
-              d={"index_key":"AIN-10","label":"AIN-10","pct_intraday":None,"basis":"prev_close",
-                 "session":{"start":os.environ.get("SESSION_START","22:30"),
-                            "end":os.environ.get("SESSION_END","05:00"),
-                            "anchor":os.environ.get("DAY_ANCHOR","22:30")},
-                 "updated_at":""}
-              J.write_text(json.dumps(d, ensure_ascii=False, indent=2), encoding="utf-8")
-            PY
-          fi
-
-      - name: Upload artifacts (debug)
+      - name: Upload artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: ain10_intraday_artifacts
           path: |
+            ${{ env.OUT_JSON }}
             ${{ env.OUT_TEXT }}
             ${{ env.SNAPSHOT_PNG }}
-            ${{ env.OUT_JSON }}
 
-      - name: Checkout site repo (for publishing)
+      - name: Checkout site repo
         uses: actions/checkout@v4
         with:
           repository: ${{ env.SITE_REPO }}
           ref: ${{ env.SITE_BRANCH }}
           token: ${{ env.PUBLISH_TOKEN }}
           path: site
-          fetch-depth: 0
 
-      - name: Copy files to site (expected names)
-        shell: bash
+      - name: Copy & push to site
         run: |
-          set -euo pipefail
+          set -e
           dst="site/${PUBLISH_DIR}"
-          mkdir -p "${dst}"
-          cp -f "${OUT_JSON}"     "${dst}/stats.json"
-          cp -f "${OUT_TEXT}"     "${dst}/post_intraday.txt"
-          cp -f "${SNAPSHOT_PNG}" "${dst}/intraday.png"
-          echo "📁 Copied to ${dst}:"
-          ls -l "${dst}"
-
-      - name: Commit & push site
-        working-directory: site
-        shell: bash
-        run: |
-          set -euo pipefail
+          mkdir -p "$dst"
+          cp -f "${OUT_JSON}" "$dst/stats.json"
+          cp -f "${OUT_TEXT}" "$dst/post_intraday.txt"
+          cp -f "${SNAPSHOT_PNG}" "$dst/intraday.png"
+          cd site
           git config user.email "actions@github.com"
-          git config user.name  "github-actions[bot]"
-          git add -A
+          git config user.name "github-actions[bot]"
+          git add .
           if git diff --cached --quiet; then
-            echo "No changes to commit."
+            echo "No site changes."
           else
-            git commit -m "Update AIN-10 intraday charts ($(TZ=Asia/Tokyo date '+%Y-%m-%d %H:%M JST'))"
-            git push origin "${SITE_BRANCH}"
+            git commit -m "Update AIN-10 intraday charts"
+            git push
           fi
-
-      - name: Post Setup Python 3.11
-        if: always()
-        run: python --version
-
-      - name: Post Checkout (this repo)
-        if: always()
-        run: echo "✅ Workflow finished."
