@@ -5,31 +5,46 @@ on:
     inputs:
       session_start:
         description: "Session start (HH:MM JST)"
-        required: false
-        default: ""
+        required: true
+        default: "22:30"
       session_end:
         description: "Session end (HH:MM JST)"
-        required: false
-        default: ""
+        required: true
+        default: "05:00"
+      day_anchor:
+        description: "Day anchor time (HH:MM JST)"
+        required: true
+        default: "22:30"
       value_type:
         description: "auto | percent | ratio"
-        required: false
+        required: true
         default: "auto"
 
 permissions:
   contents: write
 
 env:
+  # 指数固有
   INDEX_KEY: AIN-10
   LABEL: AIN-10
   CSV: docs/outputs/ain10_intraday.csv
+  DT_COL: Datetime
+  BASIS: prev_close
+
+  # ワークツリー内の出力（好きな場所でOK。サイトへは後で正規名にしてコピー）
   OUT_JSON: docs/charts/ain10_stats.json
   OUT_TEXT: docs/charts/ain10_post_intraday.txt
   SNAPSHOT_PNG: docs/charts/ain10_1d.png
+
+  # 公開サイト
   SITE_REPO: SakuraIndex/Sakura-Index-Site
   SITE_BRANCH: main
   PUBLISH_DIR: docs/charts/AIN10
   PUBLISH_TOKEN: ${{ secrets.SITE_PUBLISH_TOKEN || secrets.SITE_PAT || secrets.GITHUB_TOKEN }}
+
+concurrency:
+  group: "intraday-ain10-${{ github.ref }}"
+  cancel-in-progress: false
 
 jobs:
   build:
@@ -37,76 +52,185 @@ jobs:
     timeout-minutes: 15
 
     steps:
-      - name: Checkout repo
+      - name: Checkout (this repo)
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Setup Python
+      - name: Setup Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
       - name: Install dependencies
-        run: |
-          python -m pip install -U pip
-          python -m pip install pandas matplotlib numpy
-
-      - name: Ensure fallback PNG/JSON (safe heredoc)
         shell: bash
         run: |
-          set -euo pipefail
+          set -e
+          if [ -f requirements.txt ]; then
+            python -m pip install -U pip
+            python -m pip install -r requirements.txt
+          else
+            python -m pip install -U pip
+            python -m pip install pandas matplotlib numpy
+          fi
+
+      - name: Verify inputs & files
+        shell: bash
+        run: |
+          set -e
+          test -f "${CSV}" || (echo "❌ Missing CSV: ${CSV}" && exit 1)
+          test -f scripts/make_intraday_post.py || echo "⚠️ scripts/make_intraday_post.py が無い場合は後段のフォールバックでPNG/JSONを作ります"
           mkdir -p "$(dirname "${OUT_JSON}")" "$(dirname "${OUT_TEXT}")" "$(dirname "${SNAPSHOT_PNG}")"
 
-          echo "[step] Checking output files..."
-          if [ ! -s "${SNAPSHOT_PNG}" ] || [ ! -s "${OUT_JSON}" ]; then
-            echo "[fallback] Creating ${SNAPSHOT_PNG} / ${OUT_JSON}"
+      - name: Generate intraday snapshot and post (primary)
+        shell: bash
+        env:
+          SESSION_START: ${{ inputs.session_start }}
+          SESSION_END:   ${{ inputs.session_end }}
+          DAY_ANCHOR:    ${{ inputs.day_anchor }}
+          VALUE_TYPE:    ${{ inputs.value_type }}
+        run: |
+          set -euo pipefail
+          if [ -f scripts/make_intraday_post.py ]; then
+            echo "=== Generate ${INDEX_KEY} intraday snapshot (primary) ==="
+            python scripts/make_intraday_post.py \
+              --index-key "${INDEX_KEY}" \
+              --csv "${CSV}" \
+              --out-json "${OUT_JSON}" \
+              --out-text "${OUT_TEXT}" \
+              --snapshot-png "${SNAPSHOT_PNG}" \
+              --session-start "${SESSION_START}" \
+              --session-end   "${SESSION_END}" \
+              --day-anchor    "${DAY_ANCHOR}" \
+              --basis         "${BASIS}" \
+              --label         "${LABEL}" \
+              --dt-col        "${DT_COL}" \
+              --value-type    "${VALUE_TYPE}"
+          else
+            echo "No primary script. Will rely on fallback steps."
+          fi
 
-            cat <<'PY' > _fallback_intraday.py
-import os, json, numpy as np, pandas as pd
+      # ===== ここから安全なフォールバック =====
+      - name: Ensure fallback PNG/JSON if missing (safe heredoc)
+        shell: bash
+        env:
+          CSV: ${{ env.CSV }}
+          OUT_JSON: ${{ env.OUT_JSON }}
+          OUT_TEXT: ${{ env.OUT_TEXT }}
+          SNAPSHOT_PNG: ${{ env.SNAPSHOT_PNG }}
+          LABEL: ${{ env.LABEL }}
+          INDEX_KEY: ${{ env.INDEX_KEY }}
+          DT_COL: ${{ env.DT_COL }}
+        run: |
+          set -euo pipefail
+
+          need_png=false
+          need_json=false
+          [ -s "${SNAPSHOT_PNG}" ] || need_png=true
+          [ -s "${OUT_JSON}" ]     || need_json=true
+
+          if $need_png || $need_json; then
+            echo "[fallback] Create missing outputs: png=${need_png} json=${need_json}"
+
+            python - <<'PY'
+import os, json
+from pathlib import Path
+import pandas as pd
+import numpy as np
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from pathlib import Path
+
+CSV = Path(os.environ["CSV"])
+OUT_JSON = Path(os.environ["OUT_JSON"])
+OUT_TEXT = Path(os.environ["OUT_TEXT"])
+SNAPSHOT_PNG = Path(os.environ["SNAPSHOT_PNG"])
+LABEL = os.environ.get("LABEL","AIN-10")
+DT_COL = os.environ.get("DT_COL","Datetime")
 JST = "Asia/Tokyo"
 
-CSV = Path(os.environ.get("CSV", "docs/outputs/ain10_intraday.csv"))
-OUT_JSON = Path(os.environ.get("OUT_JSON", "docs/charts/ain10_stats.json"))
-OUT_TEXT = Path(os.environ.get("OUT_TEXT", "docs/charts/ain10_post_intraday.txt"))
-SNAPSHOT_PNG = Path(os.environ.get("SNAPSHOT_PNG", "docs/charts/ain10_1d.png"))
-LABEL = os.environ.get("LABEL", "AIN-10")
-INDEX_KEY = os.environ.get("INDEX_KEY", "AIN-10")
-
 df = pd.read_csv(CSV)
-num_cols = [c for c in df.columns if pd.to_numeric(df[c], errors="coerce").notna().mean() > 0.8]
-s = df[num_cols].mean(axis=1) if num_cols else pd.Series([0])
-last = float(np.round(s.iloc[-1], 3)) if not s.empty else 0.0
+# 日時列をできるだけ自動検出
+dt = None
+if DT_COL in df.columns:
+    dt = pd.to_datetime(df[DT_COL], errors="coerce")
+else:
+    for c in df.columns:
+        cand = pd.to_datetime(df[c], errors="coerce")
+        if cand.notna().mean() > 0.7:
+            dt = cand
+            DT_COL = c
+            break
+if dt is not None:
+    if getattr(dt.dt, "tz", None) is None:
+        dt = dt.dt.tz_localize(JST)
+    else:
+        dt = dt.dt.tz_convert(JST)
+    df.index = dt
+    if DT_COL in df.columns:
+        df = df.drop(columns=[DT_COL])
 
-plt.figure(figsize=(12, 5), dpi=160)
-plt.plot(s, color="#00E5FF" if last >= 0 else "#FF4D4D")
-plt.title(f"{LABEL} Intraday Snapshot ({last:+.2f}%)")
-plt.tight_layout()
-SNAPSHOT_PNG.parent.mkdir(parents=True, exist_ok=True)
-plt.savefig(SNAPSHOT_PNG)
+num_cols = [c for c in df.columns if pd.to_numeric(df[c], errors="coerce").notna().mean()>0.6]
+s = df[num_cols].mean(axis=1) if num_cols else pd.Series([0.0])
+last = float(np.round(s.iloc[-1], 4)) if len(s) else 0.0
 
+# PNG
+try:
+    plt.figure(figsize=(12,4), dpi=160)
+    x = s.index if getattr(s, "index", None) is not None else range(len(s))
+    y = s.values if getattr(s, "values", None) is not None else s
+    plt.plot(x, y, linewidth=2.0)
+    plt.title(f"{LABEL} Intraday Snapshot ({last:+.2f}%)")
+    plt.tight_layout()
+    SNAPSHOT_PNG.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(SNAPSHOT_PNG)
+    plt.close()
+except Exception as e:
+    print("[fallback] plotting error:", e)
+
+# TEXT
+OUT_TEXT.parent.mkdir(parents=True, exist_ok=True)
+OUT_TEXT.write_text(f"▲ {LABEL} 日中スナップショット\n{last:+.2f}% (fallback)", encoding="utf-8")
+
+# JSON（サイト互換: pct_intraday は ratio）
+OUT_JSON.parent.mkdir(parents=True, exist_ok=True)
 payload = {
-    "index_key": INDEX_KEY,
+    "index_key": os.environ.get("INDEX_KEY","AIN-10"),
     "label": LABEL,
-    "pct_intraday": round(last/100.0, 6),
-    "updated_at": pd.Timestamp.now(tz='Asia/Tokyo').isoformat()
+    "pct_intraday": float(np.round(last/100.0, 6)),
 }
 OUT_JSON.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-
-OUT_TEXT.write_text(
-    f"AIN-10 intraday snapshot: {last:+.2f}%\n#{INDEX_KEY} #日本株\n",
-    encoding="utf-8"
-)
 PY
-
-            python _fallback_intraday.py
-          else
-            echo "[ok] Existing outputs found, skipping fallback."
           fi
 
-      - name: Upload artifacts
+      - name: Normalize JSON (percent→ratio safety)
+        shell: bash
+        env:
+          OUT_JSON: ${{ env.OUT_JSON }}
+        run: |
+          set -euo pipefail
+          if [ -s "${OUT_JSON}" ]; then
+            python - <<'PY'
+import json, os
+from pathlib import Path
+p = Path(os.environ["OUT_JSON"])
+try:
+    d = json.loads(p.read_text(encoding="utf-8"))
+except Exception:
+    d = {}
+v = d.get("pct_intraday")
+# 1.0 を超える％表記なら ratio へ補正
+try:
+    if isinstance(v, (int,float)) and abs(v) > 1.0:
+        d["pct_intraday"] = round(float(v)/100.0, 6)
+        p.write_text(json.dumps(d, ensure_ascii=False, indent=2), encoding="utf-8")
+except Exception:
+    pass
+PY
+          fi
+
+      - name: Upload artifacts (debug)
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: ain10_intraday_artifacts
@@ -115,7 +239,7 @@ PY
             ${{ env.OUT_TEXT }}
             ${{ env.SNAPSHOT_PNG }}
 
-      - name: Checkout site repo
+      - name: Checkout site repo (for publishing)
         uses: actions/checkout@v4
         with:
           repository: ${{ env.SITE_REPO }}
@@ -124,27 +248,29 @@ PY
           path: site
           fetch-depth: 0
 
-      - name: Copy files to site
+      - name: Copy files into site tree (expected names)
+        shell: bash
         run: |
+          set -euo pipefail
           dst="site/${PUBLISH_DIR}"
           mkdir -p "${dst}"
           cp -f "${OUT_JSON}"     "${dst}/stats.json"
           cp -f "${OUT_TEXT}"     "${dst}/post_intraday.txt"
           cp -f "${SNAPSHOT_PNG}" "${dst}/intraday.png"
+          echo "📁 Copied to ${dst}:"
           ls -l "${dst}"
 
       - name: Commit & push site
         working-directory: site
+        shell: bash
         run: |
+          set -euo pipefail
           git config user.email "actions@github.com"
-          git config user.name "github-actions[bot]"
+          git config user.name  "github-actions[bot]"
           git add -A
           if git diff --cached --quiet; then
             echo "No changes to commit."
           else
-            git commit -m "Update AIN-10 intraday snapshot ($(date '+%Y-%m-%d %H:%M JST'))"
+            git commit -m "Update AIN-10 intraday charts ($(date '+%Y-%m-%d %H:%M JST'))"
             git push origin "${SITE_BRANCH}"
           fi
-
-      - name: Done
-        run: echo "✅ Workflow finished successfully."
