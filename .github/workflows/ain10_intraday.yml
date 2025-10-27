@@ -24,23 +24,19 @@ permissions:
   contents: write
 
 env:
-  # === 指数情報 / 入力 ===
   INDEX_KEY: AIN-10
   LABEL: AIN-10
   CSV: docs/outputs/ain10_intraday.csv
   DT_COL: Datetime
   BASIS: prev_close
 
-  # === 出力（このリポ内）===
   OUT_JSON: docs/charts/ain10_stats.json
   OUT_TEXT: docs/charts/ain10_post_intraday.txt
   SNAPSHOT_PNG: docs/charts/ain10_1d.png
 
-  # === 公開サイト ===
   SITE_REPO: SakuraIndex/Sakura-Index-Site
   SITE_BRANCH: main
   PUBLISH_DIR: docs/charts/AIN10
-  # 優先順位：SITE_PUBLISH_TOKEN → SITE_PAT → GITHUB_TOKEN
   PUBLISH_TOKEN: ${{ secrets.SITE_PUBLISH_TOKEN || secrets.SITE_PAT || secrets.GITHUB_TOKEN }}
 
 concurrency:
@@ -79,7 +75,11 @@ jobs:
         run: |
           set -e
           test -f "${CSV}" || (echo "❌ Missing CSV: ${CSV}" && exit 1)
-          test -f scripts/make_intraday_post.py && echo "ℹ️ use local script" || echo "ℹ️ no helper script (fallbacks will handle)"
+          if [ -f scripts/make_intraday_post.py ]; then
+            echo "ℹ️ scripts/make_intraday_post.py found"
+          else
+            echo "ℹ️ helper script not found; fallbacks will run"
+          fi
 
       - name: Prepare output dirs
         shell: bash
@@ -87,7 +87,7 @@ jobs:
           set -e
           mkdir -p "$(dirname "${OUT_JSON}")" "$(dirname "${OUT_TEXT}")" "$(dirname "${SNAPSHOT_PNG}")"
 
-      # 1) テキスト/JSON を優先生成（古い make_intraday_post.py 互換：--snapshot-png は渡さない）
+      # 1) まず JSON/TEXT を優先生成（古い helper に合わせて --snapshot-png は渡さない）
       - name: Generate intraday snapshot (US session, JST)
         shell: bash
         env:
@@ -98,8 +98,6 @@ jobs:
         run: |
           set -euo pipefail
           if [ -f scripts/make_intraday_post.py ]; then
-            echo "== Generate ${INDEX_KEY} intraday (script) =="
-            # 互換のため --snapshot-png は付けない
             python scripts/make_intraday_post.py \
               --index-key "${INDEX_KEY}" \
               --csv "${CSV}" \
@@ -114,52 +112,92 @@ jobs:
               --value-type "${VALUE_TYPE}" || true
           fi
 
-      # 2) PNG が無い/古い場合は CSV から作成（安全：ヒアドキュメント不使用）
+      # 2) PNG が無い/古い場合は CSV から生成（厳密ヒアドキュメントで安全）
       - name: Ensure fallback PNG (from CSV)
         shell: bash
         run: |
           set -euo pipefail
-          python -c "import os, pandas as pd, matplotlib; matplotlib.use('Agg'); import matplotlib.pyplot as plt; from pathlib import Path
-p_csv=Path(os.environ['CSV']); p_png=Path(os.environ['SNAPSHOT_PNG']); p_png.parent.mkdir(parents=True, exist_ok=True)
-df=pd.read_csv(p_csv)
-# datetime列を推定
-dt_col=None
-for c in ['Datetime','datetime','Timestamp','timestamp','Date','date','Time','time']:
-  if c in df.columns:
-    try:
-      pd.to_datetime(df[c], errors='raise'); dt_col=c; break
-    except Exception: pass
-t=pd.to_datetime(df[dt_col], errors='coerce') if dt_col else range(len(df))
+          python - <<'PY'
+import os
+from pathlib import Path
+import pandas as pd
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+p_csv = Path(os.environ["CSV"])
+p_png = Path(os.environ["SNAPSHOT_PNG"])
+p_png.parent.mkdir(parents=True, exist_ok=True)
+
+# CSV 読み込み
+df = pd.read_csv(p_csv)
+
+# datetime 列推定
+dt_col = None
+for c in ["Datetime","datetime","Timestamp","timestamp","Date","date","Time","time"]:
+    if c in df.columns:
+        try:
+            pd.to_datetime(df[c], errors="raise")
+            dt_col = c
+            break
+        except Exception:
+            pass
+
+t = pd.to_datetime(df[dt_col], errors="coerce") if dt_col else range(len(df))
+
 # 数値列を選択
-numcols=[c for c in df.columns if c!=dt_col and pd.to_numeric(df[c], errors='coerce').notna().mean()>0.6]
-col=numcols[0] if numcols else [c for c in df.columns if c!=dt_col][0]
-s=pd.to_numeric(df[col], errors='coerce')
-last=float(s.dropna().iloc[-1]) if s.dropna().size>0 else 0.0
+numcols = [c for c in df.columns if c != dt_col and pd.to_numeric(df[c], errors="coerce").notna().mean() > 0.6]
+col = numcols[0] if numcols else [c for c in df.columns if c != dt_col][0]
+
+s = pd.to_numeric(df[col], errors="coerce")
+sd = s.dropna()
+last = float(sd.iloc[-1]) if not sd.empty else 0.0
+
 plt.figure(figsize=(12,6), dpi=160)
 plt.plot(t, s, linewidth=2.0)
-plt.title(f'AIN-10 Intraday Snapshot  ({last:+.2f}%)')
+plt.title(f"AIN-10 Intraday Snapshot  ({last:+.2f}%)")
 plt.tight_layout()
-plt.savefig(p_png)" || true
+plt.savefig(p_png)
+PY
 
-      # 3) JSON を ratio(小数) に正規化。無ければ最小構造を作成して補完
+      # 3) JSON を ratio(小数) へ正規化。無ければ最小構造を生成
       - name: Normalize JSON (percent → ratio, and patch if missing)
         shell: bash
         run: |
           set -euo pipefail
-          python -c "import os, json, datetime as dt, pathlib as P
-p=P.Path(os.environ['OUT_JSON']); p.parent.mkdir(parents=True, exist_ok=True)
-if p.exists():
-  d=json.load(open(p,encoding='utf-8'))
-else:
-  d={'index_key':'AIN-10','label':'AIN-10','pct_intraday':None,'basis':'prev_close','session':{'start':'22:30','end':'05:00','anchor':'22:30'},'updated_at':''}
-v=d.get('pct_intraday', None)
-if isinstance(v,(int,float)) and abs(float(v))>1.0:
-  d['pct_intraday']=round(float(v)/100.0,6)
-if not d.get('updated_at'):
-  d['updated_at']=dt.datetime.now().astimezone().isoformat()
-json.dump(d, open(p,'w',encoding='utf-8'), ensure_ascii=False, indent=2)"
+          python - <<'PY'
+import os, json
+from pathlib import Path
+import datetime as dt
 
-      - name: Upload artifacts (debug)
+p = Path(os.environ["OUT_JSON"])
+p.parent.mkdir(parents=True, exist_ok=True)
+
+if p.exists():
+    with open(p, encoding="utf-8") as f:
+        d = json.load(f)
+else:
+    d = {
+        "index_key": "AIN-10",
+        "label": "AIN-10",
+        "pct_intraday": None,
+        "basis": "prev_close",
+        "session": {"start":"22:30","end":"05:00","anchor":"22:30"},
+        "updated_at": ""
+    }
+
+v = d.get("pct_intraday", None)
+if isinstance(v, (int, float)) and abs(float(v)) > 1.0:
+    d["pct_intraday"] = round(float(v)/100.0, 6)
+
+if not d.get("updated_at"):
+    d["updated_at"] = dt.datetime.now().astimezone().isoformat()
+
+with open(p, "w", encoding="utf-8") as f:
+    json.dump(d, f, ensure_ascii=False, indent=2)
+PY
+
+      - name: Upload artifacts (for debug)
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -169,7 +207,7 @@ json.dump(d, open(p,'w',encoding='utf-8'), ensure_ascii=False, indent=2)"
             ${{ env.OUT_JSON }}
             ${{ env.SNAPSHOT_PNG }}
 
-      # === 公開サイトへ反映 ===
+      # 4) サイトへ反映
       - name: Checkout site repo
         uses: actions/checkout@v4
         with:
@@ -179,17 +217,17 @@ json.dump(d, open(p,'w',encoding='utf-8'), ensure_ascii=False, indent=2)"
           path: site
           fetch-depth: 0
 
-      - name: Copy files into site tree (both canonical & fallback names)
+      - name: Copy files into site tree (canonical & fallback names)
         shell: bash
         run: |
           set -euo pipefail
           dst="site/${PUBLISH_DIR}"
           mkdir -p "${dst}"
-          # サイト期待名
+          # 期待名
           cp -f "${OUT_JSON}"     "${dst}/ain10_stats.json"
           cp -f "${OUT_TEXT}"     "${dst}/ain10_post_intraday.txt"
           cp -f "${SNAPSHOT_PNG}" "${dst}/ain10_1d.png"
-          # 互換のため汎用名も配置
+          # 互換の汎用名
           cp -f "${OUT_JSON}"     "${dst}/stats.json" || true
           cp -f "${OUT_TEXT}"     "${dst}/post_intraday.txt" || true
           cp -f "${SNAPSHOT_PNG}" "${dst}/intraday.png" || true
@@ -207,4 +245,10 @@ json.dump(d, open(p,'w',encoding='utf-8'), ensure_ascii=False, indent=2)"
           if git diff --cached --quiet; then
             echo "No changes to commit."
           else
-            git commit -m "Update AIN
+            git commit -m "Update AIN-10 intraday charts ($(date '+%Y-%m-%d %H:%M JST'))"
+            git push origin "${SITE_BRANCH}"
+          fi
+
+      - name: Done
+        shell: bash
+        run: echo "✅ Workflow finished."
