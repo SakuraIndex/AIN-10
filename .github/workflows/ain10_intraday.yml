@@ -24,22 +24,22 @@ permissions:
   contents: write
 
 env:
-  # ===== リポ側 =====
-  INDEX_KEY: AIN-10
+  # 主要設定
+  INDEX_KEY: AIN10           # 列名はハイフン無しを想定（CSVに合わせて調整）
   LABEL: AIN-10
   CSV: docs/outputs/ain10_intraday.csv
   DT_COL: Datetime
   BASIS: prev_close
 
-  # 生成物（リポ内の一時パス：名前は任意）
+  # このリポ内の生成物（サイトへコピー時に正規名へリネーム）
   OUT_JSON: docs/charts/ain10_stats.json
   OUT_TEXT: docs/charts/ain10_post_intraday.txt
   SNAPSHOT_PNG: docs/charts/ain10_1d.png
 
-  # ===== サイト側 =====
+  # 公開サイト
   SITE_REPO: SakuraIndex/Sakura-Index-Site
   SITE_BRANCH: main
-  PUBLISH_DIR: docs/charts/AIN10   # ←サイトは AIN10（ハイフン無し）
+  PUBLISH_DIR: docs/charts/AIN10
   PUBLISH_TOKEN: ${{ secrets.SITE_PUBLISH_TOKEN || secrets.SITE_PAT || secrets.GITHUB_TOKEN }}
 
 concurrency:
@@ -87,8 +87,7 @@ jobs:
           set -e
           mkdir -p "$(dirname "${OUT_JSON}")" "$(dirname "${OUT_TEXT}")" "$(dirname "${SNAPSHOT_PNG}")"
 
-      # ===== 生成 =====
-      - name: Generate intraday snapshot and post
+      - name: Generate intraday snapshot and post (new CLI → legacy fallback)
         env:
           SESSION_START: ${{ inputs.session_start }}
           SESSION_END:   ${{ inputs.session_end }}
@@ -98,64 +97,54 @@ jobs:
         run: |
           set -euo pipefail
           echo "=== Generate ${INDEX_KEY} intraday snapshot ==="
-          python scripts/make_intraday_post.py \
-            --index-key "${INDEX_KEY}" \
-            --csv "${CSV}" \
-            --out-json "${OUT_JSON}" \
-            --out-text "${OUT_TEXT}" \
-            --snapshot-png "${SNAPSHOT_PNG}" \
-            --session-start "${SESSION_START}" \
-            --session-end   "${SESSION_END}" \
-            --day-anchor    "${DAY_ANCHOR}" \
-            --basis         "${BASIS}" \
-            --label         "${LABEL}" \
-            --dt-col        "${DT_COL}" \
-            --value-type    "${VALUE_TYPE}"
+          if python scripts/make_intraday_post.py \
+              --index-key "${INDEX_KEY}" \
+              --csv "${CSV}" \
+              --out-json "${OUT_JSON}" \
+              --out-text "${OUT_TEXT}" \
+              --snapshot-png "${SNAPSHOT_PNG}" \
+              --session-start "${SESSION_START}" \
+              --session-end   "${SESSION_END}" \
+              --day-anchor    "${DAY_ANCHOR}" \
+              --basis         "${BASIS}" \
+              --label         "${LABEL}" \
+              --dt-col        "${DT_COL}" \
+              --value-type    "${VALUE_TYPE}"; then
+            echo "[ok] new-CLI finished."
+          else
+            echo "[fallback] try legacy CLI (reduced options)"
+            # 旧版スクリプト想定：未知オプションを渡さない
+            python scripts/make_intraday_post.py \
+              --index-key "${INDEX_KEY}" \
+              --csv "${CSV}" \
+              --out-json "${OUT_JSON}" \
+              --out-text "${OUT_TEXT}" || true
+          fi
 
-      # ===== PNG が無ければ簡易PNG（安全な独立ステップ） =====
+      # ===== PNG が無ければ簡易 PNG（ヒアドキュメント不使用・タブ無し） =====
       - name: Fallback: create simple PNG if missing
         if: ${{ always() }}
         shell: bash
         run: |
           set -euo pipefail
           if [ ! -s "${SNAPSHOT_PNG}" ]; then
-            echo "[fallback] create simple PNG → ${SNAPSHOT_PNG}"
-            python - <<'PY'
-import pandas as pd
-import matplotlib.pyplot as plt
-from pathlib import Path
-csv = Path("${CSV}"); png = Path("${SNAPSHOT_PNG}")
-df = pd.read_csv(csv)
-# 最もそれっぽい数値列の平均を簡易描画
-cols = [c for c in df.columns if c.lower() != "datetime"]
-y = df[cols].mean(axis=1) if cols else pd.Series([0])
-plt.figure(figsize=(12,4), dpi=160)
-plt.plot(range(len(y)), y)
-plt.title("AIN-10 Intraday (fallback)")
-plt.tight_layout()
-png.parent.mkdir(parents=True, exist_ok=True)
-plt.savefig(png)
-PY
+            echo "[fallback] create simple PNG -> ${SNAPSHOT_PNG}"
+            python -c "import pandas as pd, matplotlib; matplotlib.use('Agg'); import matplotlib.pyplot as plt; from pathlib import Path; csv=Path('${CSV}'); png=Path('${SNAPSHOT_PNG}'); df=pd.read_csv(csv); cols=[c for c in df.columns if c.lower()!='datetime']; y=(df[cols].mean(axis=1) if cols else pd.Series([0])); plt.figure(figsize=(12,4), dpi=160); plt.plot(range(len(y)), y); plt.title('AIN-10 Intraday (fallback)'); plt.tight_layout(); png.parent.mkdir(parents=True, exist_ok=True); plt.savefig(png)"
           fi
 
-      # ===== JSON 正規化：pct_intraday は ratio(小数)へ（安全な独立ステップ） =====
+      # ===== JSON 正規化：pct_intraday を ratio(小数)に補正（安全） =====
       - name: Normalize JSON to ratio (safety)
         if: ${{ always() }}
         shell: bash
         run: |
           set -euo pipefail
-          python - <<'PY'
-import json, pathlib, datetime
-p = pathlib.Path("${OUT_JSON}")
-if p.exists():
-    data = json.loads(p.read_text(encoding="utf-8"))
-    v = data.get("pct_intraday")
-    if isinstance(v, (int, float)) and abs(v) > 1.0:
-        # percent → ratio へ補正（例: 1.23 → 0.0123）
-        data["pct_intraday"] = round(float(v)/100.0, 6)
-        data["updated_at"] = datetime.datetime.now().astimezone().isoformat()
-        p.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-PY
+          python -c "import json, pathlib, datetime; p=pathlib.Path('${OUT_JSON}'); \
+if p.exists(): \
+  d=json.loads(p.read_text(encoding='utf-8')); \
+  v=d.get('pct_intraday'); \
+  d['pct_intraday']=round(float(v)/100.0,6) if isinstance(v,(int,float)) and abs(float(v))>1.0 else v; \
+  d['updated_at']=datetime.datetime.now().astimezone().isoformat(); \
+  p.write_text(json.dumps(d, ensure_ascii=False, indent=2), encoding='utf-8')"
 
       - name: Upload artifacts (for debug)
         if: always()
@@ -167,7 +156,6 @@ PY
             ${{ env.SNAPSHOT_PNG }}
             ${{ env.OUT_JSON }}
 
-      # ===== サイトへ反映 =====
       - name: Checkout site repo (for publishing)
         uses: actions/checkout@v4
         with:
@@ -183,7 +171,7 @@ PY
           set -euo pipefail
           dst="site/${PUBLISH_DIR}"
           mkdir -p "${dst}"
-          # サイトは固定名：stats.json / intraday.png / post_intraday.txt
+          # サイト側は stats.json / intraday.png / post_intraday.txt を参照
           cp -f "${OUT_JSON}"     "${dst}/stats.json"
           cp -f "${OUT_TEXT}"     "${dst}/post_intraday.txt"
           cp -f "${SNAPSHOT_PNG}" "${dst}/intraday.png"
