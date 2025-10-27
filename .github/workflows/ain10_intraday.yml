@@ -4,15 +4,15 @@ on:
   workflow_dispatch:
     inputs:
       session_start:
-        description: "Session start (HH:MM JST) — US: 22:30"
+        description: "Session start (HH:MM JST)"
         required: true
         default: "22:30"
       session_end:
-        description: "Session end (HH:MM JST) — US(+1): 05:00"
+        description: "Session end (HH:MM JST)"
         required: true
         default: "05:00"
       day_anchor:
-        description: "Day anchor time (HH:MM JST) — roll at 22:30"
+        description: "Day anchor time (HH:MM JST)"
         required: true
         default: "22:30"
       value_type:
@@ -29,13 +29,9 @@ env:
   CSV: docs/outputs/ain10_intraday.csv
   DT_COL: Datetime
   BASIS: prev_close
-
-  # このリポ内で生成するファイル（自由名）
   OUT_JSON: docs/charts/ain10_stats.json
   OUT_TEXT: docs/charts/ain10_post_intraday.txt
   SNAPSHOT_PNG: docs/charts/ain10_1d.png
-
-  # 公開サイト（Sakura-Index-Site）の期待パス
   SITE_REPO: SakuraIndex/Sakura-Index-Site
   SITE_BRANCH: main
   PUBLISH_DIR: docs/charts/AIN10
@@ -47,39 +43,34 @@ jobs:
     timeout-minutes: 12
 
     steps:
-      - name: Checkout (AIN-10 repo)
+      - name: Checkout repo
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
-      - name: Setup Python 3.11
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install deps
+      - name: Install dependencies
         run: |
           python -m pip install -U pip
           python -m pip install pandas matplotlib
 
-      - name: Verify inputs & files
+      - name: Verify input files
         run: |
           test -f "${CSV}" || (echo "❌ Missing CSV: ${CSV}" && exit 1)
-          test -f scripts/make_intraday_post.py || (echo "❌ Missing: scripts/make_intraday_post.py" && exit 1)
+          test -f scripts/make_intraday_post.py || (echo "❌ Missing: make_intraday_post.py" && exit 1)
 
       - name: Prepare output dirs
-        run: |
-          mkdir -p "$(dirname "${OUT_JSON}")" "$(dirname "${OUT_TEXT}")" "$(dirname "${SNAPSHOT_PNG}")"
+        run: mkdir -p $(dirname "${OUT_JSON}") $(dirname "${OUT_TEXT}") $(dirname "${SNAPSHOT_PNG}")
 
-      - name: Generate intraday snapshot (US session, JST)
+      - name: Generate intraday snapshot
         env:
           SESSION_START: ${{ inputs.session_start }}
-          SESSION_END:   ${{ inputs.session_end }}
-          DAY_ANCHOR:    ${{ inputs.day_anchor }}
-          VALUE_TYPE:    ${{ inputs.value_type }}
+          SESSION_END: ${{ inputs.session_end }}
+          DAY_ANCHOR: ${{ inputs.day_anchor }}
+          VALUE_TYPE: ${{ inputs.value_type }}
         run: |
-          set -euo pipefail
-          echo "=== Generate ${INDEX_KEY} intraday snapshot ==="
           python scripts/make_intraday_post.py \
             --index-key "${INDEX_KEY}" \
             --csv "${CSV}" \
@@ -94,33 +85,23 @@ jobs:
             --dt-col "${DT_COL}" \
             --value-type "${VALUE_TYPE}"
 
-      - name: Ensure fallback PNG/JSON if missing (no heredoc)
+      - name: Ensure fallback PNG/JSON if missing
         run: |
           set -euo pipefail
           if [ ! -f "${SNAPSHOT_PNG}" ]; then
-            echo "[fallback] generating a simple PNG → ${SNAPSHOT_PNG}"
+            echo "[fallback] Generating PNG → ${SNAPSHOT_PNG}"
             python scripts/fallback_intraday.py "${CSV}" "${SNAPSHOT_PNG}" "${INDEX_KEY}" "${DT_COL}" || true
           fi
-          # JSONが無い/壊れた時に最低限の空JSONを置く（サイトクラッシュ回避）
           if [ ! -f "${OUT_JSON}" ]; then
-            echo '[{"index_key":"AIN-10","label":"AIN-10","pct_intraday":null,"basis":"prev_close","session":{"start":"22:30","end":"05:00","anchor":"22:30"},"updated_at":""}]' \
-            | python -c "import sys,json;print(json.dumps(json.loads(sys.stdin.read()),ensure_ascii=False))" \
-            > "${OUT_JSON}" || true
-            # 単一オブジェクトに整える
-            python - <<'PY' || true
-import json, sys
-p = "${OUT_JSON}"
-try:
-    d = json.loads(open(p, encoding="utf-8").read())
-    if isinstance(d, list) and d:
-        d = d[0]
-    if not isinstance(d, dict):
-        d = {"index_key":"AIN-10","label":"AIN-10","pct_intraday":None,"basis":"prev_close",
-             "session":{"start":"22:30","end":"05:00","anchor":"22:30"},"updated_at":""}
-    open(p,"w",encoding="utf-8").write(json.dumps(d, ensure_ascii=False, indent=2))
-except Exception as e:
-    sys.exit(0)
-PY
+            echo "[fallback] Creating minimal JSON → ${OUT_JSON}"
+            python - <<EOF
+import json, sys, os
+d = {"index_key":"AIN-10","label":"AIN-10","pct_intraday":None,"basis":"prev_close",
+     "session":{"start":"22:30","end":"05:00","anchor":"22:30"},"updated_at":""}
+os.makedirs(os.path.dirname("${OUT_JSON}"), exist_ok=True)
+with open("${OUT_JSON}", "w", encoding="utf-8") as f:
+    json.dump(d, f, ensure_ascii=False, indent=2)
+EOF
           fi
 
       - name: Upload artifacts (debug)
@@ -133,7 +114,7 @@ PY
             ${{ env.SNAPSHOT_PNG }}
             ${{ env.OUT_JSON }}
 
-      - name: Checkout site repo (publishing)
+      - name: Checkout site repo
         uses: actions/checkout@v4
         with:
           repository: ${{ env.SITE_REPO }}
@@ -142,24 +123,19 @@ PY
           path: site
           fetch-depth: 0
 
-      - name: Copy files into site tree (site-expected names)
+      - name: Copy to site tree
         run: |
-          set -euo pipefail
           dst="site/${PUBLISH_DIR}"
           mkdir -p "${dst}"
-          # サイト側の期待名：stats.json / post_intraday.txt / intraday.png
           cp -f "${OUT_JSON}"     "${dst}/stats.json"
           cp -f "${OUT_TEXT}"     "${dst}/post_intraday.txt"
           cp -f "${SNAPSHOT_PNG}" "${dst}/intraday.png"
-          echo "📁 Copied to ${dst}:"
-          ls -l "${dst}"
 
       - name: Commit & push site
         working-directory: site
         run: |
-          set -euo pipefail
           git config user.email "actions@github.com"
-          git config user.name  "github-actions[bot]"
+          git config user.name "github-actions[bot]"
           git add -A
           if git diff --cached --quiet; then
             echo "No changes to commit."
