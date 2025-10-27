@@ -1,139 +1,80 @@
-name: AIN-10 • long charts & intraday percent (diag)
+name: Generate long-term charts (AIN-10 1d/7d/1m/1y + stats)
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: "*/10 0-8 * * 1-5"
+    - cron: '30 21 * * 1-5'  # 米市場クローズ後（UTC 21:30 ≒ NY 16:30）目安。要調整。
 
-permissions:
-  contents: write
+permissions: { contents: write }
 
 concurrency:
-  group: ain10-long
+  group: long-charts-${{ github.ref }}
   cancel-in-progress: false
-
-env:
-  INDEX_KEY: ain10
-  OUT_DIR: docs/outputs
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 12
-
+    timeout-minutes: 25
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0, persist-credentials: true }
 
-      - name: Show workflow marker & SHA
+      - name: Resolve
+        id: resolve
         run: |
-          echo "=== MARKER: ain10-long.yml (diag) is loaded ==="
-          echo "GITHUB_SHA=$GITHUB_SHA"
-          echo "BRANCH (ref)=$GITHUB_REF"
+          echo "INDEX_KEY=ain10" | tee -a "$GITHUB_ENV"
+          echo "market_tz=America/New_York" >> "$GITHUB_OUTPUT"
+          echo "session_start=09:30"        >> "$GITHUB_OUTPUT"
+          echo "session_end=16:00"          >> "$GITHUB_OUTPUT"
 
-      - name: Setup Python 3.11
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+
+      - uses: actions/cache@v4
         with:
-          python-version: "3.11"
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: ${{ runner.os }}-pip-
 
       - name: Install deps
         run: |
-          set -euxo pipefail
-          python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-          python - <<'PY'
-          import sys, matplotlib
-          print("=== DIAG ===")
-          print("Python:", sys.version.split()[0])
-          print("Matplotlib:", getattr(matplotlib, "__version__", "n/a"))
-          PY
+          pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; else pip install pandas numpy matplotlib; fi
 
-      # ───────── 長期チャート生成 ─────────
-      - name: DIAG • Check files before plotting
-        run: |
-          set -euxo pipefail
-          echo "=== ls -la scripts ==="
-          ls -la scripts || true
-          echo "=== ls -la docs/outputs (before) ==="
-          ls -la docs/outputs || true
-          test -f scripts/long_charts.py || (echo "scripts/long_charts.py NOT FOUND" && exit 2)
-          echo "=== MARKER: long_charts step will run ==="
+      - run: rm -rf scripts/__pycache__ || true
 
       - name: Generate long-term charts
+        env:
+          INDEX_KEY: ${{ env.INDEX_KEY }}
+          MARKET_TZ: ${{ steps.resolve.outputs.market_tz }}
+          SESSION_START: ${{ steps.resolve.outputs.session_start }}
+          SESSION_END: ${{ steps.resolve.outputs.session_end }}
         run: |
-          set -euxo pipefail
           python scripts/long_charts.py
-          echo "=== MARKER: long_charts finished ==="
+          ls -lah docs/outputs || true
 
-      - name: DIAG • Check files after plotting
+      - name: Normalize legacy filenames
         run: |
-          set -euxo pipefail
-          echo "=== git status (after plot) ==="
-          git status --porcelain || true
-          echo "=== ls -la docs/outputs (after) ==="
-          ls -la docs/outputs || true
+          OUTDIR="docs/outputs"; shopt -s nullglob
+          for f in "$OUTDIR"/ain_10_*; do
+            base="$(basename "$f")"; mv -f "$f" "$OUTDIR/${base/ain_10_/ain10_}"
+          done
 
-      # ───────── 1d（確定系） ─────────
-      - name: Compute 1d percent & write posts (from 1d.csv)
+      - name: Sanity check - prefix
+        env: { INDEX_KEY: ${{ env.INDEX_KEY }} }
         run: |
-          set -euxo pipefail
-          python scripts/ain10_pct_post.py \
-            --index-key "${INDEX_KEY}" \
-            --csv "${OUT_DIR}/${INDEX_KEY}_1d.csv" \
-            --out-json "${OUT_DIR}/${INDEX_KEY}_stats.json" \
-            --out-text "${OUT_DIR}/${INDEX_KEY}_post_intraday.txt" \
-            --basis open
-          echo "--- ${INDEX_KEY}_stats.json (1d-based) ---"
-          head -c 400 "${OUT_DIR}/${INDEX_KEY}_stats.json" || true
-          echo
-
-      # ───────── intraday（速報系で上書き） ─────────
-      - name: Make intraday post (from intraday.csv)
-        run: |
-          set -euxo pipefail
-          if [ -f "${OUT_DIR}/${INDEX_KEY}_intraday.csv" ]; then
-            python scripts/make_intraday_post.py \
-              --index-key "${INDEX_KEY}" \
-              --csv "${OUT_DIR}/${INDEX_KEY}_intraday.csv" \
-              --out-text "${OUT_DIR}/${INDEX_KEY}_post_intraday.txt" \
-              --out-json "${OUT_DIR}/${INDEX_KEY}_stats.json"
-            echo "--- TXT variants (intraday) ---"
-            for f in \
-              "${OUT_DIR}/${INDEX_KEY}_post_intraday.txt" \
-              "${OUT_DIR}/ain_10_post_intraday.txt" \
-              "${OUT_DIR}/${INDEX_KEY}_intraday_post.txt" \
-              "${OUT_DIR}/ain_10_intraday_post.txt"; do
-              if [ -f "$f" ]; then echo "$f"; sed -n '1p' "$f" || true; fi
-            done
-            echo "--- ${INDEX_KEY}_stats.json (intraday-based override) ---"
-            head -c 400 "${OUT_DIR}/${INDEX_KEY}_stats.json" || true
-          else
-            echo "WARN: ${OUT_DIR}/${INDEX_KEY}_intraday.csv not found, skipped intraday post."
-          fi
-          echo
-
-      - name: Upload artifacts (for debug)
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: ain10-outputs
-          path: |
-            docs/outputs/*.csv
-            docs/outputs/*.png
-            docs/outputs/*post*.txt
-            docs/outputs/*stats*.json
+          OUTDIR="docs/outputs"; shopt -s nullglob; err=0
+          for f in "$OUTDIR"/*; do
+            b="$(basename "$f")"; case "$b" in README.md|_last_run.txt) continue;; esac
+            [[ "$b" == "${INDEX_KEY}_"* ]] || { echo "❌ prefix mismatch: $b"; err=1; }
+          done
+          [ $err -eq 0 ] || exit 1
+          echo "✅ Prefix check passed."
 
       - name: Commit charts if changed
         run: |
-          set -euxo pipefail
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add -A docs/outputs
-          if ! git diff --cached --quiet; then
-            git commit -m "chore(charts): update ${INDEX_KEY} (1d/7d/1m/1y + stats + intraday)"
-            git push
-          else
-            echo "No changes to commit."
-          fi
+          git add docs/outputs/${{ env.INDEX_KEY }}_{1d,7d,1m,1y}.png 2>/dev/null || true
+          git add docs/outputs/*_stats.json 2>/dev/null || true
+          if git diff --cached --quiet; then echo "No changes"; else git commit -m "chore(charts): update long charts & stats (${{ env.INDEX_KEY }})"; git push; fi
