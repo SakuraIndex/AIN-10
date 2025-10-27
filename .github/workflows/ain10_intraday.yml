@@ -30,12 +30,10 @@ env:
   DT_COL: Datetime
   BASIS: prev_close
 
-  # このリポ内の生成物（後段でサイト名に合わせてコピー）
   OUT_JSON: docs/charts/ain10_stats.json
   OUT_TEXT: docs/charts/ain10_post_intraday.txt
   SNAPSHOT_PNG: docs/charts/ain10_1d.png
 
-  # 公開サイト
   SITE_REPO: SakuraIndex/Sakura-Index-Site
   SITE_BRANCH: main
   PUBLISH_DIR: docs/charts/AIN10
@@ -84,7 +82,7 @@ jobs:
           set -e
           mkdir -p "$(dirname "${OUT_JSON}")" "$(dirname "${OUT_TEXT}")" "$(dirname "${SNAPSHOT_PNG}")"
 
-      - name: Generate intraday snapshot and post (new CLI)
+      - name: Generate intraday snapshot and post
         shell: bash
         env:
           SESSION_START: ${{ inputs.session_start }}
@@ -108,7 +106,6 @@ jobs:
             --dt-col        "${DT_COL}" \
             --value-type    "${VALUE_TYPE}"
 
-      # 万一 PNG が出ていない場合のフォールバック（YAML安全版）
       - name: Fallback: create simple PNG if missing
         if: ${{ always() }}
         shell: bash
@@ -134,7 +131,7 @@ plt.savefig(png)
 PY
           fi
 
-      - name: Normalize JSON (pct_intraday to ratio if accidentally percent)
+      - name: Normalize JSON to ratio (safety)
         if: ${{ always() }}
         shell: bash
         run: |
@@ -145,9 +142,10 @@ p = pathlib.Path("${OUT_JSON}")
 if p.exists():
     d = json.loads(p.read_text(encoding="utf-8"))
     x = d.get("pct_intraday", None)
-    if isinstance(x, (int, float)) and abs(x) > 1.0:  # looks like percent
+    if isinstance(x, (int, float)) and abs(x) > 1.0:
         d["pct_intraday"] = round(float(x)/100.0, 6)
-    d.setdefault("updated_at", datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=9))).isoformat())
+    d.setdefault("updated_at",
+                 datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=9))).isoformat())
     p.write_text(json.dumps(d, ensure_ascii=False, indent=2), encoding="utf-8")
 PY
 
@@ -170,17 +168,15 @@ PY
           path: site
           fetch-depth: 0
 
-      - name: Copy snapshot files into site tree (use site-expected names)
+      - name: Copy snapshot files into site tree
         shell: bash
         run: |
           set -euo pipefail
           dst="site/${PUBLISH_DIR}"
           mkdir -p "${dst}"
-          # サイト側は stats.json / intraday.png / post_intraday.txt を読む
           cp -f "${OUT_JSON}"     "${dst}/stats.json"
           cp -f "${OUT_TEXT}"     "${dst}/post_intraday.txt"
           cp -f "${SNAPSHOT_PNG}" "${dst}/intraday.png"
-          echo "📁 Copied to ${dst}:"
           ls -l "${dst}"
 
       - name: Commit & push site charts
