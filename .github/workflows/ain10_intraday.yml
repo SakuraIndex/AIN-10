@@ -3,16 +3,16 @@ name: "AIN-10 • intraday + publish (US Market Time)"
 on:
   workflow_dispatch:
     inputs:
-      sess_start:
-        description: "Session start (JST HH:MM)"
+      session_start:
+        description: "Session start (HH:MM JST) — US: 22:30"
         required: true
         default: "22:30"
-      sess_end:
-        description: "Session end (JST HH:MM)"
+      session_end:
+        description: "Session end (HH:MM JST) — US(+1): 05:00"
         required: true
         default: "05:00"
       day_anchor:
-        description: "Day anchor (JST HH:MM)"
+        description: "Day anchor time (HH:MM JST) — roll at 22:30"
         required: true
         default: "22:30"
       value_type:
@@ -30,28 +30,24 @@ env:
   DT_COL: Datetime
   BASIS: prev_close
 
-  # 生成物（このリポ内・任意名）
+  # このリポ内で生成するファイル（自由名）
   OUT_JSON: docs/charts/ain10_stats.json
   OUT_TEXT: docs/charts/ain10_post_intraday.txt
   SNAPSHOT_PNG: docs/charts/ain10_1d.png
 
-  # 公開サイト
+  # 公開サイト（Sakura-Index-Site）の期待パス
   SITE_REPO: SakuraIndex/Sakura-Index-Site
   SITE_BRANCH: main
   PUBLISH_DIR: docs/charts/AIN10
   PUBLISH_TOKEN: ${{ secrets.SITE_PUBLISH_TOKEN || secrets.SITE_PAT || secrets.GITHUB_TOKEN }}
 
-concurrency:
-  group: "intraday-ain10-${{ github.ref }}"
-  cancel-in-progress: false
-
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 12
 
     steps:
-      - name: Checkout (this repo)
+      - name: Checkout (AIN-10 repo)
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
@@ -62,37 +58,25 @@ jobs:
           python-version: "3.11"
 
       - name: Install deps
-        shell: bash
         run: |
-          set -e
           python -m pip install -U pip
-          if [ -f requirements.txt ]; then
-            python -m pip install -r requirements.txt
-          else
-            python -m pip install pandas matplotlib numpy
-          fi
+          python -m pip install pandas matplotlib
 
       - name: Verify inputs & files
-        shell: bash
         run: |
-          set -e
           test -f "${CSV}" || (echo "❌ Missing CSV: ${CSV}" && exit 1)
-          test -f scripts/make_intraday_post.py || (echo "❌ Missing script: scripts/make_intraday_post.py" && exit 1)
+          test -f scripts/make_intraday_post.py || (echo "❌ Missing: scripts/make_intraday_post.py" && exit 1)
 
       - name: Prepare output dirs
-        shell: bash
         run: |
           mkdir -p "$(dirname "${OUT_JSON}")" "$(dirname "${OUT_TEXT}")" "$(dirname "${SNAPSHOT_PNG}")"
 
-      # ── メイン生成（失敗しても後続フォールバックで補完）
       - name: Generate intraday snapshot (US session, JST)
-        id: try_primary
-        shell: bash
         env:
-          SESS_START: ${{ inputs.sess_start }}
-          SESS_END:   ${{ inputs.sess_end }}
-          DAY_ANCHOR: ${{ inputs.day_anchor }}
-          VALUE_TYPE: ${{ inputs.value_type }}
+          SESSION_START: ${{ inputs.session_start }}
+          SESSION_END:   ${{ inputs.session_end }}
+          DAY_ANCHOR:    ${{ inputs.day_anchor }}
+          VALUE_TYPE:    ${{ inputs.value_type }}
         run: |
           set -euo pipefail
           echo "=== Generate ${INDEX_KEY} intraday snapshot ==="
@@ -102,50 +86,42 @@ jobs:
             --out-json "${OUT_JSON}" \
             --out-text "${OUT_TEXT}" \
             --snapshot-png "${SNAPSHOT_PNG}" \
-            --session-start "${SESS_START}" \
-            --session-end "${SESS_END}" \
+            --session-start "${SESSION_START}" \
+            --session-end "${SESSION_END}" \
             --day-anchor "${DAY_ANCHOR}" \
             --basis "${BASIS}" \
             --label "${LABEL}" \
             --dt-col "${DT_COL}" \
             --value-type "${VALUE_TYPE}"
 
-      # ── フォールバック（heredoc 不使用で YAML 安定）
       - name: Ensure fallback PNG/JSON if missing (no heredoc)
-        if: steps.try_primary.outcome != 'success'
-        shell: bash
-        env:
-          CSV:           ${{ env.CSV }}
-          OUT_JSON:      ${{ env.OUT_JSON }}
-          OUT_TEXT:      ${{ env.OUT_TEXT }}
-          SNAPSHOT_PNG:  ${{ env.SNAPSHOT_PNG }}
-          LABEL:         ${{ env.LABEL }}
-          DT_COL:        ${{ env.DT_COL }}
         run: |
           set -euo pipefail
-          need_png=false; need_json=false
-          [ -f "${SNAPSHOT_PNG}" ] || need_png=true
-          [ -f "${OUT_JSON}" ]     || need_json=true
-          if $need_png || $need_json; then
-            echo "[fallback] generating ${SNAPSHOT_PNG} / ${OUT_JSON}"
-            python scripts/fallback_intraday.py
+          if [ ! -f "${SNAPSHOT_PNG}" ]; then
+            echo "[fallback] generating a simple PNG → ${SNAPSHOT_PNG}"
+            python scripts/fallback_intraday.py "${CSV}" "${SNAPSHOT_PNG}" "${INDEX_KEY}" "${DT_COL}" || true
           fi
-
-      # 念のため：pct_intraday を ratio(±0.***) に正規化
-      - name: Normalize JSON (pct_intraday → ratio)
-        shell: bash
-        run: |
-          set -euo pipefail
-          python - <<'PY'
-          import json, pathlib
-          p = pathlib.Path("${{ env.OUT_JSON }}")
-          if p.exists():
-              d = json.loads(p.read_text(encoding="utf-8"))
-              v = d.get("pct_intraday", None)
-              if isinstance(v, (int, float)) and abs(v) > 1.0:
-                  d["pct_intraday"] = round(v/100.0, 6)
-                  p.write_text(json.dumps(d, ensure_ascii=False, indent=2), encoding="utf-8")
-          PY
+          # JSONが無い/壊れた時に最低限の空JSONを置く（サイトクラッシュ回避）
+          if [ ! -f "${OUT_JSON}" ]; then
+            echo '[{"index_key":"AIN-10","label":"AIN-10","pct_intraday":null,"basis":"prev_close","session":{"start":"22:30","end":"05:00","anchor":"22:30"},"updated_at":""}]' \
+            | python -c "import sys,json;print(json.dumps(json.loads(sys.stdin.read()),ensure_ascii=False))" \
+            > "${OUT_JSON}" || true
+            # 単一オブジェクトに整える
+            python - <<'PY' || true
+import json, sys
+p = "${OUT_JSON}"
+try:
+    d = json.loads(open(p, encoding="utf-8").read())
+    if isinstance(d, list) and d:
+        d = d[0]
+    if not isinstance(d, dict):
+        d = {"index_key":"AIN-10","label":"AIN-10","pct_intraday":None,"basis":"prev_close",
+             "session":{"start":"22:30","end":"05:00","anchor":"22:30"},"updated_at":""}
+    open(p,"w",encoding="utf-8").write(json.dumps(d, ensure_ascii=False, indent=2))
+except Exception as e:
+    sys.exit(0)
+PY
+          fi
 
       - name: Upload artifacts (debug)
         if: always()
@@ -154,10 +130,10 @@ jobs:
           name: ain10_intraday_artifacts
           path: |
             ${{ env.OUT_TEXT }}
-            ${{ env.OUT_JSON }}
             ${{ env.SNAPSHOT_PNG }}
+            ${{ env.OUT_JSON }}
 
-      - name: Checkout site repo
+      - name: Checkout site repo (publishing)
         uses: actions/checkout@v4
         with:
           repository: ${{ env.SITE_REPO }}
@@ -166,21 +142,20 @@ jobs:
           path: site
           fetch-depth: 0
 
-      - name: Copy files into site (expected names)
-        shell: bash
+      - name: Copy files into site tree (site-expected names)
         run: |
           set -euo pipefail
           dst="site/${PUBLISH_DIR}"
           mkdir -p "${dst}"
-          # サイト側は stats.json / post_intraday.txt / intraday.png を参照
+          # サイト側の期待名：stats.json / post_intraday.txt / intraday.png
           cp -f "${OUT_JSON}"     "${dst}/stats.json"
           cp -f "${OUT_TEXT}"     "${dst}/post_intraday.txt"
           cp -f "${SNAPSHOT_PNG}" "${dst}/intraday.png"
-          echo "📁 Copied to ${dst}"; ls -l "${dst}"
+          echo "📁 Copied to ${dst}:"
+          ls -l "${dst}"
 
-      - name: Commit & push to site
+      - name: Commit & push site
         working-directory: site
-        shell: bash
         run: |
           set -euo pipefail
           git config user.email "actions@github.com"
@@ -190,5 +165,5 @@ jobs:
             echo "No changes to commit."
           else
             git commit -m "Update AIN-10 intraday charts ($(date '+%Y-%m-%d %H:%M JST'))"
-            git push origin "${{ env.SITE_BRANCH }}"
+            git push origin "${SITE_BRANCH}"
           fi
