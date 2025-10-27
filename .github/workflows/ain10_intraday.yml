@@ -60,24 +60,29 @@ jobs:
           python-version: "3.11"
 
       - name: Install dependencies
+        shell: bash
         run: |
-          pip install -U pip
-          pip install pandas matplotlib
+          set -e
+          python -m pip install -U pip
+          python -m pip install pandas matplotlib
 
       - name: Verify inputs & files
+        shell: bash
         run: |
+          set -e
           test -f "${CSV}" || (echo "❌ Missing CSV: ${CSV}" && exit 1)
-          test -f scripts/make_intraday_post.py || (echo "❌ Missing make_intraday_post.py" && exit 1)
+          test -f scripts/make_intraday_post.py || (echo "❌ Missing script: scripts/make_intraday_post.py" && exit 1)
 
-      - name: Generate AIN-10 intraday snapshot
+      - name: Generate intraday snapshot (US session, JST)
+        shell: bash
         env:
           SESSION_START: ${{ inputs.session_start }}
-          SESSION_END: ${{ inputs.session_end }}
-          DAY_ANCHOR: ${{ inputs.day_anchor }}
-          VALUE_TYPE: ${{ inputs.value_type }}
+          SESSION_END:   ${{ inputs.session_end }}
+          DAY_ANCHOR:    ${{ inputs.day_anchor }}
+          VALUE_TYPE:    ${{ inputs.value_type }}
         run: |
-          echo "=== Generate ${INDEX_KEY} intraday snapshot ==="
           set -e
+          echo "=== Generate ${INDEX_KEY} intraday snapshot ==="
           python scripts/make_intraday_post.py \
             --index-key "${INDEX_KEY}" \
             --csv "${CSV}" \
@@ -85,56 +90,68 @@ jobs:
             --out-text "${OUT_TEXT}" \
             --snapshot-png "${SNAPSHOT_PNG}" \
             --session-start "${SESSION_START}" \
-            --session-end "${SESSION_END}" \
-            --day-anchor "${DAY_ANCHOR}" \
-            --basis "${BASIS}" \
-            --label "${LABEL}" \
-            --dt-col "${DT_COL}" \
-            --value-type "${VALUE_TYPE}" || echo "[fallback] primary CLI failed"
+            --session-end   "${SESSION_END}" \
+            --day-anchor    "${DAY_ANCHOR}" \
+            --basis         "${BASIS}" \
+            --label         "${LABEL}" \
+            --dt-col        "${DT_COL}" \
+            --value-type    "${VALUE_TYPE}" || echo "[fallback] primary CLI failed"
 
       - name: Ensure fallback PNG if missing
+        shell: bash
         run: |
+          set -e
           if [ ! -s "${SNAPSHOT_PNG}" ]; then
             echo "[fallback] generating simple PNG → ${SNAPSHOT_PNG}"
-            python - <<'PY'
-import pandas as pd, matplotlib
+            cat > _fallback_png.py <<'PY'
+import os
+from pathlib import Path
+import pandas as pd
+import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from pathlib import Path
-csv = Path("docs/outputs/ain10_intraday.csv")
-png = Path("docs/charts/ain10_1d.png")
+
+csv = Path(os.environ["CSV"])
+png = Path(os.environ["SNAPSHOT_PNG"])
+
 df = pd.read_csv(csv)
 cols = [c for c in df.columns if c.lower() != "datetime"]
 y = df[cols].mean(axis=1) if cols else pd.Series([0])
+
 plt.figure(figsize=(12,4), dpi=160)
-plt.plot(y, color="cyan")
+plt.plot(y)
 plt.title("AIN-10 Intraday (fallback)")
 plt.tight_layout()
 png.parent.mkdir(parents=True, exist_ok=True)
 plt.savefig(png)
 PY
+            python _fallback_png.py
           fi
 
-      - name: Normalize JSON (pct_intraday → ratio)
+      - name: Normalize JSON (pct_intraday → ratio, safe)
+        shell: bash
         run: |
+          set -e
           if [ -s "${OUT_JSON}" ]; then
-            python - <<'PY'
-import json, datetime, pathlib
-p = pathlib.Path("docs/charts/ain10_stats.json")
+            cat > _normalize_json.py <<'PY'
+import json, os, pathlib, datetime
+p = pathlib.Path(os.environ["OUT_JSON"])
 d = json.loads(p.read_text(encoding="utf-8"))
-v = d.get("pct_intraday")
+v = d.get("pct_intraday", None)
 try:
     fv = float(v)
-    if abs(fv) > 1.0:
+    if abs(fv) > 1.0:   # percent → ratio
         d["pct_intraday"] = round(fv / 100.0, 6)
 except Exception:
     pass
 d["updated_at"] = datetime.datetime.now().astimezone().isoformat()
 p.write_text(json.dumps(d, ensure_ascii=False, indent=2), encoding="utf-8")
 PY
+            python _normalize_json.py
           fi
 
       - name: Upload artifacts (debug)
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: ain10_intraday_artifacts
@@ -152,26 +169,33 @@ PY
           path: site
           fetch-depth: 0
 
-      - name: Copy snapshot files to site tree
+      - name: Copy files to site (expected names)
+        shell: bash
         run: |
-          mkdir -p site/${PUBLISH_DIR}
-          cp -f "${OUT_JSON}" site/${PUBLISH_DIR}/stats.json
-          cp -f "${OUT_TEXT}" site/${PUBLISH_DIR}/post_intraday.txt
-          cp -f "${SNAPSHOT_PNG}" site/${PUBLISH_DIR}/intraday.png
-          echo "✅ Copied to site/${PUBLISH_DIR}"
+          set -e
+          dst="site/${PUBLISH_DIR}"
+          mkdir -p "${dst}"
+          cp -f "${OUT_JSON}"     "${dst}/stats.json"
+          cp -f "${OUT_TEXT}"     "${dst}/post_intraday.txt"
+          cp -f "${SNAPSHOT_PNG}" "${dst}/intraday.png"
+          echo "📁 Copied to ${dst}"
+          ls -l "${dst}"
 
-      - name: Commit & push updates
+      - name: Commit & push site
         working-directory: site
+        shell: bash
         run: |
+          set -e
           git config user.email "actions@github.com"
-          git config user.name "github-actions[bot]"
+          git config user.name  "github-actions[bot]"
           git add -A
           if git diff --cached --quiet; then
             echo "No changes to commit."
           else
-            git commit -m "Update AIN-10 intraday charts ($(date '+%Y-%m-%d %H:%M JST'))"
+            git commit -m "Update AIN-10 intraday (US session) $(date '+%Y-%m-%d %H:%M JST')"
             git push origin "${SITE_BRANCH}"
           fi
 
       - name: Done
-        run: echo "✅ Workflow completed successfully."
+        shell: bash
+        run: echo "✅ AIN-10 intraday workflow finished."
