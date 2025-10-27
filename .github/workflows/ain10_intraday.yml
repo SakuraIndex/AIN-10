@@ -24,13 +24,13 @@ permissions:
   contents: write
 
 env:
-  INDEX_KEY: AIN-10
+  INDEX_KEY: AIN10
   LABEL: AIN-10
   CSV: docs/outputs/ain10_intraday.csv
   DT_COL: Datetime
   BASIS: prev_close
 
-  # このリポ内の一時出力（名前は任意）
+  # このリポ内の生成物（後段でサイト名に合わせてコピー）
   OUT_JSON: docs/charts/ain10_stats.json
   OUT_TEXT: docs/charts/ain10_post_intraday.txt
   SNAPSHOT_PNG: docs/charts/ain10_1d.png
@@ -49,7 +49,6 @@ jobs:
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 12
-
     steps:
       - name: Checkout (this repo)
         uses: actions/checkout@v4
@@ -65,11 +64,10 @@ jobs:
         shell: bash
         run: |
           set -e
+          python -m pip install -U pip
           if [ -f requirements.txt ]; then
-            python -m pip install -U pip
             python -m pip install -r requirements.txt
           else
-            python -m pip install -U pip
             python -m pip install pandas matplotlib
           fi
 
@@ -79,9 +77,14 @@ jobs:
           set -e
           test -f "${CSV}" || (echo "❌ Missing CSV: ${CSV}" && exit 1)
           test -f scripts/make_intraday_post.py || (echo "❌ Missing script: scripts/make_intraday_post.py" && exit 1)
+
+      - name: Prepare output directories
+        shell: bash
+        run: |
+          set -e
           mkdir -p "$(dirname "${OUT_JSON}")" "$(dirname "${OUT_TEXT}")" "$(dirname "${SNAPSHOT_PNG}")"
 
-      - name: Generate intraday snapshot and post (new CLI → legacy fallback)
+      - name: Generate intraday snapshot and post (new CLI)
         shell: bash
         env:
           SESSION_START: ${{ inputs.session_start }}
@@ -91,42 +94,37 @@ jobs:
         run: |
           set -euo pipefail
           echo "=== Generate ${INDEX_KEY} intraday snapshot ==="
+          python scripts/make_intraday_post.py \
+            --index-key "${INDEX_KEY}" \
+            --csv "${CSV}" \
+            --out-json "${OUT_JSON}" \
+            --out-text "${OUT_TEXT}" \
+            --snapshot-png "${SNAPSHOT_PNG}" \
+            --session-start "${SESSION_START}" \
+            --session-end   "${SESSION_END}" \
+            --day-anchor    "${DAY_ANCHOR}" \
+            --basis         "${BASIS}" \
+            --label         "${LABEL}" \
+            --dt-col        "${DT_COL}" \
+            --value-type    "${VALUE_TYPE}"
 
-          # 1) 新CLIトライ
-          if python scripts/make_intraday_post.py \
-              --index-key "${INDEX_KEY}" \
-              --csv "${CSV}" \
-              --out-json "${OUT_JSON}" \
-              --out-text "${OUT_TEXT}" \
-              --snapshot-png "${SNAPSHOT_PNG}" \
-              --session-start "${SESSION_START}" \
-              --session-end "${SESSION_END}" \
-              --day-anchor "${DAY_ANCHOR}" \
-              --basis "${BASIS}" \
-              --label "${LABEL}" \
-              --dt-col "${DT_COL}" \
-              --value-type "${VALUE_TYPE}"; then
-            echo "[ok] new CLI finished."
-          else
-            echo "[fallback] try legacy CLI (reduced options)"
-            # 2) 旧CLI（最小引数）
-            python scripts/make_intraday_post.py \
-              --index-key "${INDEX_KEY}" \
-              --csv "${CSV}" \
-              --out-json "${OUT_JSON}" \
-              --out-text "${OUT_TEXT}"
-          fi
-
-          # 3) PNGが無いなら簡易PNGを作る
-          if [ ! -f "${SNAPSHOT_PNG}" ]; then
+      # 万一 PNG が出ていない場合のフォールバック（YAML安全版）
+      - name: Fallback: create simple PNG if missing
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ ! -s "${SNAPSHOT_PNG}" ]; then
             echo "[fallback] create simple PNG → ${SNAPSHOT_PNG}"
             python - <<'PY'
-import pandas as pd, matplotlib.pyplot as plt, pathlib as P
-csv = P.Path("${CSV}"); png = P.Path("${SNAPSHOT_PNG}")
+import pandas as pd
+import matplotlib.pyplot as plt
+from pathlib import Path
+csv = Path("${CSV}")
+png = Path("${SNAPSHOT_PNG}")
 df = pd.read_csv(csv)
-# Datetime 以外の数値列の平均を描く（暫定）
-cols = [c for c in df.columns if c.lower()!="datetime"]
-y = df[cols].mean(axis=1) if cols else pd.Series([0])
+cols = [c for c in df.columns if c.lower() != "datetime"]
+y = df[cols].mean(axis=1) if cols else pd.Series([0.0])
 plt.figure(figsize=(12,4), dpi=160)
 plt.plot(range(len(y)), y)
 plt.title("AIN-10 Intraday (fallback)")
@@ -136,31 +134,21 @@ plt.savefig(png)
 PY
           fi
 
-          # 4) JSON 正規化（pct_intraday は ratio=小数へ揃える）
+      - name: Normalize JSON (pct_intraday to ratio if accidentally percent)
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -euo pipefail
           python - <<'PY'
 import json, pathlib, datetime
 p = pathlib.Path("${OUT_JSON}")
 if p.exists():
-    data = json.loads(p.read_text(encoding="utf-8"))
-    # キーの標準化
-    data["index_key"] = data.get("index_key") or "AIN-10"
-    data["label"] = data.get("label") or "AIN-10"
-    # pct_intraday を ratio へ（>1 or <-1 を%とみなして /100）
-    v = data.get("pct_intraday", None)
-    try:
-        v = float(v)
-        if abs(v) > 1.0:   # 例: +1.46 → 0.0146
-            v = round(v/100.0, 6)
-        data["pct_intraday"] = v
-    except Exception:
-        data["pct_intraday"] = None
-    # session/basis/updated_at の補完
-    data.setdefault("basis", "${BASIS}")
-    data.setdefault("session", {"start":"${{ inputs.session_start }}","end":"${{ inputs.session_end }}","anchor":"${{ inputs.day_anchor }}"})
-    data.setdefault("updated_at", datetime.datetime.now(datetime.UTC).isoformat())
-    p.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-else:
-    raise SystemExit("JSON not found for normalization: " + str(p))
+    d = json.loads(p.read_text(encoding="utf-8"))
+    x = d.get("pct_intraday", None)
+    if isinstance(x, (int, float)) and abs(x) > 1.0:  # looks like percent
+        d["pct_intraday"] = round(float(x)/100.0, 6)
+    d.setdefault("updated_at", datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=9))).isoformat())
+    p.write_text(json.dumps(d, ensure_ascii=False, indent=2), encoding="utf-8")
 PY
 
       - name: Upload artifacts (for debug)
@@ -182,12 +170,13 @@ PY
           path: site
           fetch-depth: 0
 
-      - name: Copy snapshot files into site tree (site-expected names)
+      - name: Copy snapshot files into site tree (use site-expected names)
         shell: bash
         run: |
           set -euo pipefail
           dst="site/${PUBLISH_DIR}"
           mkdir -p "${dst}"
+          # サイト側は stats.json / intraday.png / post_intraday.txt を読む
           cp -f "${OUT_JSON}"     "${dst}/stats.json"
           cp -f "${OUT_TEXT}"     "${dst}/post_intraday.txt"
           cp -f "${SNAPSHOT_PNG}" "${dst}/intraday.png"
