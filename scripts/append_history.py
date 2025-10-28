@@ -1,87 +1,147 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+"""
+AIN-10: append one daily row into docs/outputs/ain10_history.csv
+- Prefer chaining by daily pct change if available
+- Otherwise, use snapshot level but auto-rescale to match yesterday's magnitude
+- Timezone: America/New_York, session 09:30–16:00
+"""
 
+import json
+import math
 import os
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from datetime import datetime
+
 import pandas as pd
+import pytz
 
-INDEX_KEY = os.environ.get("INDEX_KEY", "ain10")
-OUT_DIR   = Path(os.environ.get("OUT_DIR", "docs/outputs"))
-OUT_DIR.mkdir(parents=True, exist_ok=True)
+OUTDIR = Path("docs/outputs")
+HIST   = OUTDIR / "ain10_history.csv"
+STATS  = OUTDIR / "ain10_stats.json"     # 騰落率が取れるならここから
+SNAP   = OUTDIR / "ain10_latest.txt"     # 直近スナップ（絶対値）
+LAST_RUN = OUTDIR / "_last_run.txt"
 
-HIST_CSV  = OUT_DIR / f"{INDEX_KEY}_history.csv"
-LATEST_TXT= OUT_DIR / f"{INDEX_KEY}_latest.txt"         # 例: 456.78
-POST_TXT  = OUT_DIR / f"{INDEX_KEY}_post.txt"           # 任意（存在すれば）
-INTRA_CSV = OUT_DIR / f"{INDEX_KEY}_intraday.csv"       # ts,value の形が望ましい
+NY = pytz.timezone("America/New_York")
+SESSION_START = (9, 30)
+SESSION_END   = (16, 0)
 
-def _diag(msg): print(f"[append] {msg}", flush=True)
+MAX_ABS_DAILY_MOVE = 0.25    # 25% を超える変化は異常としてスキップ
 
-def _read_latest_value() -> float | None:
-    # 1) latest.txt
-    if LATEST_TXT.exists():
-        try:
-            v = float(LATEST_TXT.read_text().strip())
-            _diag(f"use latest.txt = {v}")
-            return v
-        except Exception:
-            pass
-    # 2) post.txt
-    if POST_TXT.exists():
-        try:
-            v = float(POST_TXT.read_text().strip())
-            _diag(f"use post.txt = {v}")
-            return v
-        except Exception:
-            pass
-    # 3) intraday.csv の最終行
-    if INTRA_CSV.exists():
-        try:
-            dfi = pd.read_csv(INTRA_CSV)
-            if dfi.shape[1] >= 2:
-                # 先頭2列を ts, val と見なす
-                dfi = dfi.rename(columns={dfi.columns[0]:"ts", dfi.columns[1]:"val"})
-                dfi["ts"]  = pd.to_datetime(dfi["ts"], errors="coerce")
-                dfi        = dfi.dropna(subset=["ts","val"]).sort_values("ts")
-                if not dfi.empty:
-                    v = float(dfi.iloc[-1]["val"])
-                    _diag(f"use intraday.csv last = {v}")
-                    return v
-        except Exception:
-            pass
+def now_ny():
+    return datetime.now(tz=NY)
+
+def today_ymd_ny():
+    return now_ny().strftime("%Y-%m-%d")
+
+def read_history() -> pd.DataFrame:
+    if not HIST.exists():
+        return pd.DataFrame(columns=["date","value"])
+    df = pd.read_csv(HIST)
+    if df.shape[1] < 2:
+        df = pd.DataFrame(columns=["date","value"])
+    df.columns = ["date","value"]
+    return df
+
+def write_history(df: pd.DataFrame):
+    df.to_csv(HIST, index=False)
+
+def read_stats_pct() -> float | None:
+    # 期待キー: {"pct_intraday": 1.23, ...} / あるいは {"pct_close": 1.23}
+    if not STATS.exists():
+        return None
+    try:
+        d = json.loads(STATS.read_text(encoding="utf-8"))
+        for k in ("pct_close", "pct_intraday", "pct_change"):
+            if k in d and isinstance(d[k], (int, float)):
+                return float(d[k]) / 100.0
+    except Exception:
+        pass
     return None
 
-def _load_history() -> pd.DataFrame:
-    if HIST_CSV.exists():
-        try:
-            df = pd.read_csv(HIST_CSV)
-            if df.shape[1] >= 2:
-                df = df.rename(columns={df.columns[0]:"date", df.columns[1]:"value"})
-                df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.date
-                df = df.dropna(subset=["date","value"]).drop_duplicates(subset=["date"], keep="last")
-                return df.sort_values("date").reset_index(drop=True)
-        except Exception:
-            pass
-    return pd.DataFrame(columns=["date","value"])
+def read_snapshot_level() -> float | None:
+    if not SNAP.exists():
+        return None
+    try:
+        return float(SNAP.read_text(encoding="utf-8").strip())
+    except Exception:
+        return None
 
-def main():
-    today = datetime.utcnow().date()   # 日付キーはUTC基準（市場TZで管理したい場合は適宜変更）
-    val = _read_latest_value()
-    if val is None:
-        _diag("no source value found; skip append.")
+def is_trading_done_ny(ts: datetime) -> bool:
+    h, m = ts.hour, ts.minute
+    sh, sm = SESSION_START
+    eh, em = SESSION_END
+    after_open   = (h > sh) or (h == sh and m >= sm)
+    after_close  = (h > eh) or (h == eh and m >= em)
+    return after_close
+
+def rescale_to_match(prev: float, new_abs: float) -> float:
+    """桁ズレ補正: new_abs * (10^k) で prev に最も近い倍率を選ぶ"""
+    if prev <= 0 or new_abs <= 0:
+        return new_abs
+    candidates = []
+    for k in (-2, -1, 0, 1, 2):
+        cand = new_abs * (10 ** k)
+        diff = abs(cand - prev)
+        candidates.append((diff, cand))
+    candidates.sort(key=lambda x: x[0])
+    return candidates[0][1]
+
+def append_once():
+    # まだ場が終わっていないなら何もしない（NYクローズ後に追記）
+    if not is_trading_done_ny(now_ny()):
+        print("[append] NY session not closed yet. skip.")
         return
 
-    df = _load_history()
-    # 既存日に上書き or 新規行追加
-    df = df[df["date"] != today]
-    df = pd.concat([df, pd.DataFrame([{"date": today, "value": val}])], ignore_index=True)
-    df = df.sort_values("date").reset_index(drop=True)
+    df = read_history()
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df = df.dropna(subset=["date"]).sort_values("date").reset_index(drop=True)
 
-    # 保存（ヘッダ: date,value）
-    df_out = df.copy()
-    df_out["date"] = df_out["date"].astype(str)
-    HIST_CSV.write_text(df_out.to_csv(index=False))
-    _diag(f"APPENDED {today} = {val} -> {HIST_CSV}")
+    # 今日の日付（NY）
+    d_today = pd.to_datetime(today_ymd_ny())
+
+    # 既に今日分が入っていれば何もしない
+    if not df.empty and (df["date"].dt.date == d_today.date()).any():
+        print("[append] already appended today. skip.")
+        return
+
+    # 前日レベル
+    if df.empty:
+        prev_level = None
+    else:
+        prev_level = float(df.iloc[-1]["value"])
+
+    # まずは pct を優先
+    pct = read_stats_pct()
+    if pct is not None and prev_level is not None:
+        if abs(pct) > MAX_ABS_DAILY_MOVE:
+            print(f"[append] abnormal pct={pct*100:.2f}% > {MAX_ABS_DAILY_MOVE*100:.0f}%. skip.")
+            return
+        new_level = prev_level * (1.0 + pct)
+        print(f"[append] by pct: prev={prev_level:.6f} -> new={new_level:.6f} ({pct*100:.2f}%)")
+    else:
+        # スナップショットで補完（桁補正）
+        snap = read_snapshot_level()
+        if snap is None:
+            print("[append] no pct and no snapshot. nothing to do.")
+            return
+        if prev_level is None:
+            new_level = snap
+            print(f"[append] init by snapshot: {new_level:.6f}")
+        else:
+            new_level = rescale_to_match(prev_level, snap)
+            move = (new_level - prev_level) / prev_level
+            if abs(move) > MAX_ABS_DAILY_MOVE:
+                print(f"[append] abnormal jump after rescale: {move*100:.2f}%. skip.")
+                return
+            print(f"[append] by snapshot-rescale: prev={prev_level:.6f} -> snap={snap:.6f} -> new={new_level:.6f}")
+
+    # 追記
+    row = pd.DataFrame([{"date": d_today.strftime("%Y-%m-%d"), "value": new_level}])
+    df_out = pd.concat([df, row], ignore_index=True)
+    write_history(df_out)
+    LAST_RUN.write_text(datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"))
 
 if __name__ == "__main__":
-    main()
+    OUTDIR.mkdir(parents=True, exist_ok=True)
+    append_once()
