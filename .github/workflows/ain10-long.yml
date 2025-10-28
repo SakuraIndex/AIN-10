@@ -1,13 +1,11 @@
-name: Generate long-term charts (AIN-10 7d/1m/1y + history)
+name: Generate long-term charts (AIN-10 7d/1m/1y + stats)
 
 on:
   workflow_dispatch:
   schedule:
-    # 米国東部時間の引け後（16:00 ET 以降）を想定して、毎日 21:15 UTC 実行
-    - cron: '15 21 * * *'
+    - cron: '20 21 * * 1-5'   # 16:20 ET (週日) → JST翌朝
 
-permissions:
-  contents: write
+permissions: { contents: write }
 
 concurrency:
   group: ain10-long-${{ github.ref }}
@@ -17,23 +15,19 @@ jobs:
   long:
     runs-on: ubuntu-latest
     timeout-minutes: 20
-
     env:
       INDEX_KEY: ain10
       OUT_DIR: docs/outputs
-      MARKET_TZ: America/New_York     # ← 米国市場
+      MARKET_TZ: America/New_York
       SESSION_START: "09:30"
       SESSION_END:   "16:00"
 
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          persist-credentials: true
+        with: { fetch-depth: 0, persist-credentials: true }
 
       - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
+        with: { python-version: "3.11" }
 
       - uses: actions/cache@v4
         with:
@@ -42,46 +36,32 @@ jobs:
           restore-keys: ${{ runner.os }}-pip-
 
       - name: Install deps
-        shell: bash
         run: |
           pip install --upgrade pip
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; else pip install pandas numpy matplotlib pytz; fi
+          pip install -r requirements.txt
 
-      - name: Append daily to history
-        shell: bash
+      # ① 履歴を追記（自動スケール補正を含む）
+      - name: Append daily history
+        run: python scripts/append_history.py
+
+      # ② 長期チャートを描画（1d は別ワークフローがある想定なら出力しない）
+      - name: Render 7d/1m/1y
         env:
-          INDEX_KEY: ${{ env.INDEX_KEY }}
-          OUT_DIR:   ${{ env.OUT_DIR }}
           MARKET_TZ: ${{ env.MARKET_TZ }}
-        run: |
-          python scripts/append_history.py
-          tail -n 5 "$OUT_DIR/${INDEX_KEY}_history.csv" || true
-
-      - name: Render 7d/1m/1y charts (level)
-        shell: bash
-        env:
-          INDEX_KEY:     ${{ env.INDEX_KEY }}
-          OUT_DIR:       ${{ env.OUT_DIR }}
-          MARKET_TZ:     ${{ env.MARKET_TZ }}
           SESSION_START: ${{ env.SESSION_START }}
-          SESSION_END:   ${{ env.SESSION_END }}
+          SESSION_END: ${{ env.SESSION_END }}
         run: |
           python scripts/long_charts.py
           date -u +"%Y-%m-%dT%H:%M:%SZ" > "$OUT_DIR/_last_run.txt"
-          ls -lah "$OUT_DIR"
 
       - name: Commit if changed
-        shell: bash
-        env:
-          INDEX_KEY: ${{ env.INDEX_KEY }}
-          OUT_DIR:   ${{ env.OUT_DIR }}
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add -A "$OUT_DIR"
+          git add -A docs/outputs
           if git diff --cached --quiet; then
-            echo "No changes to commit."
+            echo "No changes."
           else
-            git commit -m "chore(${INDEX_KEY}): append history and long-term charts (7d/1m/1y)"
+            git commit -m "chore(ain10): append history and long-term charts"
             git push
           fi
