@@ -1,24 +1,29 @@
-name: Generate long-term charts (AIN-10 1d/7d/1m/1y + stats)
+name: Generate long-term charts (AIN-10 7d/1m/1y + history)
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: '30 21 * * 1-5'  # 21:30 UTC ≒ NY 16:30
+    # 米国東部時間の引け後（16:00 ET 以降）を想定して、毎日 21:15 UTC 実行
+    - cron: '15 21 * * *'
 
 permissions:
   contents: write
 
 concurrency:
-  group: long-charts-${{ github.ref }}
+  group: ain10-long-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
-  build:
+  long:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 20
 
     env:
       INDEX_KEY: ain10
+      OUT_DIR: docs/outputs
+      MARKET_TZ: America/New_York     # ← 米国市場
+      SESSION_START: "09:30"
+      SESSION_END:   "16:00"
 
     steps:
       - uses: actions/checkout@v4
@@ -26,16 +31,9 @@ jobs:
           fetch-depth: 0
           persist-credentials: true
 
-      - name: Resolve
-        id: resolve
-        shell: bash
-        run: |
-          echo "market_tz=America/New_York" >> "$GITHUB_OUTPUT"
-          echo "session_start=09:30"        >> "$GITHUB_OUTPUT"
-          echo "session_end=16:00"          >> "$GITHUB_OUTPUT"
-
       - uses: actions/setup-python@v5
-        with: { python-version: "3.11" }
+        with:
+          python-version: "3.11"
 
       - uses: actions/cache@v4
         with:
@@ -47,59 +45,43 @@ jobs:
         shell: bash
         run: |
           pip install --upgrade pip
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; else pip install pandas numpy matplotlib; fi
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; else pip install pandas numpy matplotlib pytz; fi
 
-      - name: Clear pycache
-        shell: bash
-        run: rm -rf scripts/__pycache__ || true
-
-      - name: Update history (if available)
-        shell: bash
-        run: |
-          if [ -f scripts/update_history.py ]; then python scripts/update_history.py || true; fi
-
-      - name: Generate long-term charts
-        shell: bash
-        env:
-          MARKET_TZ: ${{ steps.resolve.outputs.market_tz }}
-          SESSION_START: ${{ steps.resolve.outputs.session_start }}
-          SESSION_END: ${{ steps.resolve.outputs.session_end }}
-        run: |
-          python scripts/long_charts.py
-          ls -lah docs/outputs || true
-
-      - name: Normalize legacy filenames
-        shell: bash
-        run: |
-          OUTDIR="docs/outputs"; shopt -s nullglob
-          for f in "$OUTDIR"/ain_10_*; do
-            base="$(basename "$f")"; mv -f "$f" "$OUTDIR/${base/ain_10_/ain10_}"
-          done
-
-      - name: Sanity check - prefix
+      - name: Append daily to history
         shell: bash
         env:
           INDEX_KEY: ${{ env.INDEX_KEY }}
+          OUT_DIR:   ${{ env.OUT_DIR }}
+          MARKET_TZ: ${{ env.MARKET_TZ }}
         run: |
-          OUTDIR="docs/outputs"; shopt -s nullglob; err=0
-          for f in "$OUTDIR"/*; do
-            b="$(basename "$f")"
-            case "$b" in README.md|_last_run.txt) continue;; esac
-            [[ "$b" == "${INDEX_KEY}_"* ]] || { echo "X prefix mismatch: $b"; err=1; }
-          done
-          [ $err -eq 0 ] || exit 1
-          echo "✓ Prefix check passed."
+          python scripts/append_history.py
+          tail -n 5 "$OUT_DIR/${INDEX_KEY}_history.csv" || true
 
-      - name: Commit charts if changed
+      - name: Render 7d/1m/1y charts (level)
         shell: bash
+        env:
+          INDEX_KEY:     ${{ env.INDEX_KEY }}
+          OUT_DIR:       ${{ env.OUT_DIR }}
+          MARKET_TZ:     ${{ env.MARKET_TZ }}
+          SESSION_START: ${{ env.SESSION_START }}
+          SESSION_END:   ${{ env.SESSION_END }}
+        run: |
+          python scripts/long_charts.py
+          date -u +"%Y-%m-%dT%H:%M:%SZ" > "$OUT_DIR/_last_run.txt"
+          ls -lah "$OUT_DIR"
+
+      - name: Commit if changed
+        shell: bash
+        env:
+          INDEX_KEY: ${{ env.INDEX_KEY }}
+          OUT_DIR:   ${{ env.OUT_DIR }}
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add docs/outputs/${INDEX_KEY}_{1d,7d,1m,1y}.png 2>/dev/null || true
-          git add docs/outputs/*_stats.json 2>/dev/null || true
+          git add -A "$OUT_DIR"
           if git diff --cached --quiet; then
-            echo "No changes"
+            echo "No changes to commit."
           else
-            git commit -m "chore(charts): update long charts & stats (${INDEX_KEY})"
+            git commit -m "chore(${INDEX_KEY}): append history and long-term charts (7d/1m/1y)"
             git push
           fi
