@@ -1,0 +1,42 @@
+{
+  "index_key": "AIN10",
+  "label": "AIN-10",
+  "category": "米AI関連大型株",
+  "description": "米国のAI関連大型株で構成する指数。汎用AI/クラウド/半導体/セキュリティのリーダー群の地合いを、時価総額加重で把握します。日中は前日終値比（％）を可視化。",
+  "methodology": {
+    "universe": "米国上場のAI関連大型株",
+    "weighting": "時価総額加重（free-float時価総額ベースを推奨）",
+    "weights_source": "直近期の浮動株調整後時価総額。リバランス時に更新",
+    "calc_basis": "prev_close（％）",
+    "fx": "USD建ての変化率を採用（現状）",
+    "intraday_source": "主要取引所の1分〜5分足終値",
+    "rebalancing": "四半期または必要に応じて（構成・時価総額の変化に対応）",
+    "notes": "可視化は±25%でクリップ。構成比は meta の weights または算出時点の時価総額から決定。"
+  },
+  "constituents_file": "docs/tickers_ain10.txt",
+  "constituents": [
+    { "ticker": "GOOG", "name": "Alphabet" },
+    { "ticker": "AMZN", "name": "Amazon.com" },
+    { "ticker": "META", "name": "Meta Platforms" },
+    { "ticker": "NVDA", "name": "NVIDIA" },
+    { "ticker": "MSFT", "name": "Microsoft" },
+    { "ticker": "AMD",  "name": "Advanced Micro Devices" },
+    { "ticker": "ORCL", "name": "Oracle" },
+    { "ticker": "PLTR", "name": "Palantir Technologies" },
+    { "ticker": "CRWD", "name": "CrowdStrike" },
+    { "ticker": "SNOW", "name": "Snowflake" }
+  ],
+  "weights": {
+    "_comment": "必要に応じて固定比率をここに入れてください（合計1.0）。空欄時は算出時の時価総額から自動決定。",
+    "GOOG": null,
+    "AMZN": null,
+    "META": null,
+    "NVDA": null,
+    "MSFT": null,
+    "AMD": null,
+    "ORCL": null,
+    "PLTR": null,
+    "CRWD": null,
+    "SNOW": null
+  }
+}
